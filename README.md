@@ -17,6 +17,9 @@ No dependencies — stdlib Python 3.10+ only.
 # Approve all payments (default)
 python3 naps_emulator.py
 
+# Operator prompted to approve/decline each payment interactively
+python3 naps_emulator.py --mode interactive
+
 # Decline all payments (RC=005)
 python3 naps_emulator.py --mode decline
 
@@ -87,10 +90,30 @@ The header line contains `"TKpay"` (bold, centred).
 | `--mode` | Phase-1 | Phase-2 | Use case |
 |---|---|---|---|
 | `approve` | RC=000 + full receipt | RC=000 + receipt | Normal flow |
+| `interactive` | Operator prompted per payment | RC=000 + receipt (if approved) | Manual approve/decline during demos |
 | `decline` | RC=005 + REFUSE | — | Card declined |
 | `error` | RC=`--code` | — | Specific error codes (909, 302, 482…) |
 | `timeout` | Hangs forever | — | Test Phase-1 client timeout |
 | `no_confirm` | RC=000 | Hangs forever | Test 40-second Phase-2 timeout |
+
+---
+
+## Interactive mode
+
+In `--mode interactive` the terminal displays a prompt for each incoming Phase-1 request:
+
+```
+  ┌── Payment from 127.0.0.1:52341 ──
+  │  Amount : 150.00 MAD
+  │  Card   : 516794******3315
+  └── [a] Approve   [d] Decline  → 
+```
+
+Type `a` (or `approve`, `y`, `yes`, or press Enter) to approve.
+Type `d` (or `decline`, `n`, `no`) to decline (RC=005).
+
+If no answer arrives within 120 seconds the payment is auto-approved.
+Concurrent connections are serialised — one prompt at a time.
 
 ---
 
