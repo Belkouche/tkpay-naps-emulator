@@ -1,11 +1,7 @@
 # NAPS Pay M2M TLV Terminal Emulator
 
 Python TCP server that emulates a NAPS Pay terminal for local development and testing.
-Speaks the exact two-phase M2M TLV protocol on **port 4444**, 
-
-
-
-
+Speaks the two-phase M2M TLV protocol on **port 4444**.
 
 No dependencies — stdlib Python 3.10+ only.
 
