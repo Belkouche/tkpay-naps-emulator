@@ -85,6 +85,18 @@ def dump(fields: dict[str, str]) -> str:
         for tag, val in fields.items()
     )
 
+
+TM_NAMES = {
+    "001": "Payment",
+    "002": "Confirmation",
+    "003": "Cancellation",
+    "008": "Duplicate receipt",
+    "009": "Network test",
+    "010": "Totals",
+    "012": "Reset PinPAD",
+    "013": "Referencing",
+}
+
 # ── Receipt builder ───────────────────────────────────────────────────────────
 
 def _receipt_line(line_num: int, content: str, align: str, style: str,
@@ -212,6 +224,74 @@ def phase2_response(req: dict, phase1_stan: str) -> str:
     )
 
 
+def cancellation_response(req: dict) -> str:
+    """TM=003 → TM=103  RC=000 (void accepted)."""
+    stan = req.get("008", generate_stan())
+    return _common_fields(req, "103", "000") + f("008", stan)
+
+
+def network_test_response(req: dict) -> str:
+    """TM=009 → TM=109  RC=000."""
+    return _common_fields(req, "109", "000")
+
+
+def totals_response(req: dict) -> str:
+    """TM=010 → TM=110  RC=000 with a simple totals receipt."""
+    now       = datetime.now()
+    date_str  = now.strftime("%d/%m/%Y %H:%M:%S")
+    lines = [
+        _receipt_line(0,  "TKpay",              "C", "G"),
+        _receipt_line(2,  LINE_SEP,              "G", "S"),
+        _receipt_line(3,  date_str,              "G", "S"),
+        _receipt_line(4,  "TOTAUX DU JOUR",      "C", "G"),
+        _receipt_line(5,  LINE_SEP,              "G", "S"),
+        _receipt_line(6,  "VENTES:     0000000", "G", "S"),
+        _receipt_line(7,  "ANNULATIONS:       0","G", "S"),
+        _receipt_line(8,  LINE_SEP,              "G", "S"),
+        _receipt_line(9,  "MONTANT:   0.00 MAD", "G", "S"),
+        _receipt_line(10, LINE_SEP,              "G", "S", last=True),
+    ]
+    dp = "".join(lines)
+    return _common_fields(req, "110", "000") + f("010", dp)
+
+
+def duplicate_response(req: dict, last_stan: str | None) -> str:
+    """TM=008 → TM=108  RC=000 reprints the last receipt or a dummy."""
+    stan   = last_stan or generate_stan()
+    amount = 0
+    auth   = generate_approval()
+    ncai   = req.get("003", "0100001")
+    dp     = build_receipt(amount, stan, MASKED_CARD, auth, ncai, is_customer_copy=False)
+    return _common_fields(req, "108", "000") + f("008", stan) + f("010", dp)
+
+
+def referencing_response(req: dict) -> str:
+    """TM=013 → TM=113  RC=000 with basic merchant config receipt."""
+    now      = datetime.now()
+    date_str = now.strftime("%d/%m/%Y %H:%M:%S")
+    lines = [
+        _receipt_line(0,  "TKpay",              "C", "G"),
+        _receipt_line(2,  LINE_SEP,              "G", "S"),
+        _receipt_line(3,  date_str,              "G", "S"),
+        _receipt_line(4,  "PARAMETRES",          "C", "G"),
+        _receipt_line(5,  LINE_SEP,              "G", "S"),
+        _receipt_line(6,  "MID: 000000000001",   "G", "S"),
+        _receipt_line(7,  "TID: 00000001",       "G", "S"),
+        _receipt_line(8,  "DEVISE: MAD (504)",   "G", "S"),
+        _receipt_line(9,  LINE_SEP,              "G", "S"),
+        _receipt_line(10, "TKPAY DEMO",          "G", "S"),
+        _receipt_line(11, "CASABLANCA",           "G", "S"),
+        _receipt_line(12, LINE_SEP,              "G", "S", last=True),
+    ]
+    dp = "".join(lines)
+    return _common_fields(req, "113", "000") + f("010", dp)
+
+
+def reset_response(req: dict) -> str:
+    """TM=012 → TM=112  RC=000."""
+    return _common_fields(req, "112", "000")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 MASKED_CARD = "516794******3315"
@@ -287,6 +367,11 @@ def recv_message(conn: socket.socket) -> bytes:
     return data
 
 
+def send(conn: socket.socket, resp: str, charset: str) -> None:
+    """Send a response, appending '?' as end-of-message terminator."""
+    conn.sendall((resp + FS2).encode(charset))
+
+
 def handle_client(conn: socket.socket, addr: tuple,
                   mode: str, error_code: str) -> None:
     peer = f"{addr[0]}:{addr[1]}"
@@ -312,11 +397,12 @@ def handle_client(conn: socket.socket, addr: tuple,
             fields = parse(raw)
             tm     = fields.get("001", "?")
 
-            log.info(f"[{peer}] received TM={tm}")
+            tm_name = TM_NAMES.get(tm, f"TM={tm}")
+            log.info(f"[{peer}] received {tm_name} (TM={tm})")
             if log.isEnabledFor(logging.DEBUG):
                 log.debug(f"[{peer}] fields:\n{dump(fields)}")
 
-            # ── Phase 1: Payment Request (TM=001) ────────────────────────────
+            # ── TM=001  Payment request ───────────────────────────────────────
             if tm == "001":
                 if mode == "timeout":
                     log.info(f"[{peer}] MODE=timeout — hanging (client will time out)")
@@ -329,10 +415,9 @@ def handle_client(conn: socket.socket, addr: tuple,
                 stan   = rf.get("008", "?")
                 current_stan = stan
                 log.info(f"[{peer}] Phase-1 → RC={rc}  STAN={stan}")
+                send(conn, resp, CHARSET)
 
-                conn.sendall(resp.encode(CHARSET))
-
-            # ── Phase 2: Confirmation Request (TM=002) ───────────────────────
+            # ── TM=002  Confirmation ──────────────────────────────────────────
             elif tm == "002":
                 if mode == "no_confirm":
                     log.info(f"[{peer}] MODE=no_confirm — hanging on Phase-2")
@@ -342,13 +427,50 @@ def handle_client(conn: socket.socket, addr: tuple,
                 stan_to_use = current_stan or fields.get("008", generate_stan())
                 resp = phase2_response(fields, stan_to_use)
                 log.info(f"[{peer}] Phase-2 → RC=000  STAN={stan_to_use}")
-
-                conn.sendall(resp.encode(CHARSET))
+                send(conn, resp, CHARSET)
                 log.info(f"[{peer}] transaction complete")
                 current_stan = None
 
+            # ── TM=003  Cancellation/void ─────────────────────────────────────
+            elif tm == "003":
+                stan = fields.get("008", "?")
+                resp = cancellation_response(fields)
+                log.info(f"[{peer}] Cancellation → RC=000  STAN={stan}")
+                send(conn, resp, CHARSET)
+                current_stan = None
+
+            # ── TM=008  Duplicate receipt ─────────────────────────────────────
+            elif tm == "008":
+                resp = duplicate_response(fields, current_stan)
+                log.info(f"[{peer}] Duplicate receipt → RC=000")
+                send(conn, resp, CHARSET)
+
+            # ── TM=009  Network test ──────────────────────────────────────────
+            elif tm == "009":
+                resp = network_test_response(fields)
+                log.info(f"[{peer}] Network test → RC=000")
+                send(conn, resp, CHARSET)
+
+            # ── TM=010  Totals ────────────────────────────────────────────────
+            elif tm == "010":
+                resp = totals_response(fields)
+                log.info(f"[{peer}] Totals → RC=000")
+                send(conn, resp, CHARSET)
+
+            # ── TM=012  Reset PinPAD ──────────────────────────────────────────
+            elif tm == "012":
+                resp = reset_response(fields)
+                log.info(f"[{peer}] Reset PinPAD → RC=000")
+                send(conn, resp, CHARSET)
+
+            # ── TM=013  Referencing ───────────────────────────────────────────
+            elif tm == "013":
+                resp = referencing_response(fields)
+                log.info(f"[{peer}] Referencing → RC=000")
+                send(conn, resp, CHARSET)
+
             else:
-                log.warning(f"[{peer}] unexpected TM={tm!r}, ignoring")
+                log.warning(f"[{peer}] unhandled TM={tm!r}, ignoring")
 
     except Exception as e:
         log.error(f"[{peer}] error: {e}")
