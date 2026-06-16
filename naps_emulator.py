@@ -49,8 +49,19 @@ FS2          = "?"
 
 # ── TLV helpers ──────────────────────────────────────────────────────────────
 
+def _ascii(value: str) -> str:
+    """Replace non-ASCII chars with ASCII equivalents to keep TLV byte-length == char-length."""
+    return (value
+            .replace("ç", "c").replace("Ç", "C")
+            .replace("è", "e").replace("é", "e").replace("ê", "e").replace("ë", "e")
+            .replace("à", "a").replace("â", "a")
+            .replace("î", "i").replace("ï", "i")
+            .replace("ô", "o").replace("ù", "u").replace("û", "u"))
+
+
 def f(tag: str, value: str) -> str:
-    """Encode one TLV field: TAG(3) + LENGTH(3) + VALUE (length capped at 999)."""
+    """Encode one TLV field: TAG(3) + LENGTH(3) + VALUE."""
+    value = _ascii(value)
     n = min(len(value), 999)
     return f"{tag}{n:03d}{value[:n]}"
 
@@ -101,14 +112,13 @@ TM_NAMES = {
 
 def _receipt_line(line_num: int, content: str, align: str, style: str,
                   last: bool = False) -> str:
-    sub = (
+    content = _ascii(content)
+    return (
         "030002" + f"{line_num:02d}" +
         "031001" + style +
         "032001" + align +
-        "033" + f"{len(content):03d}" + content +
-        (FS2 if last else FS1)
+        "033" + f"{len(content):03d}" + content
     )
-    return sub
 
 
 def build_receipt(amount_centimes: int, stan: str, masked_card: str,
@@ -209,12 +219,11 @@ def phase1_response(req: dict, mode: str, error_code: str,
     )
 
 
-def phase2_response(req: dict, phase1_stan: str) -> str:
+def phase2_response(req: dict, phase1_stan: str, phase1_amount: int) -> str:
     stan   = phase1_stan
     ncai   = req.get("003", "0100001")
-    amount = int(req.get("002", "0") or "0")
     auth   = generate_approval()
-    dp     = build_receipt(amount, stan, MASKED_CARD, auth, ncai, is_customer_copy=True)
+    dp     = build_receipt(phase1_amount, stan, MASKED_CARD, auth, ncai, is_customer_copy=True)
 
     return (
         _common_fields(req, "102", "000") +
@@ -379,7 +388,8 @@ def handle_client(conn: socket.socket, addr: tuple,
 
     conn.settimeout(180)
 
-    current_stan: str | None = None
+    current_stan:   str | None = None
+    current_amount: int       = 0
 
     try:
         while True:
@@ -413,7 +423,8 @@ def handle_client(conn: socket.socket, addr: tuple,
                 rf     = parse(resp)
                 rc     = rf.get("013", "?")
                 stan   = rf.get("008", "?")
-                current_stan = stan
+                current_stan   = stan
+                current_amount = int(fields.get("002", "0") or "0")
                 log.info(f"[{peer}] Phase-1 → RC={rc}  STAN={stan}")
                 send(conn, resp, CHARSET)
 
@@ -425,11 +436,12 @@ def handle_client(conn: socket.socket, addr: tuple,
                     break
 
                 stan_to_use = current_stan or fields.get("008", generate_stan())
-                resp = phase2_response(fields, stan_to_use)
+                resp = phase2_response(fields, stan_to_use, current_amount)
                 log.info(f"[{peer}] Phase-2 → RC=000  STAN={stan_to_use}")
                 send(conn, resp, CHARSET)
                 log.info(f"[{peer}] transaction complete")
-                current_stan = None
+                current_stan   = None
+                current_amount = 0
 
             # ── TM=003  Cancellation/void ─────────────────────────────────────
             elif tm == "003":
