@@ -121,6 +121,29 @@ def _receipt_line(line_num: int, content: str, align: str, style: str,
     )
 
 
+def build_decline_receipt(rc: str, stan: str,
+                          merchant_name: str = "TKPAY DEMO",
+                          merchant_city: str = "CASABLANCA",
+                          term_id: str = "00000001") -> str:
+    now      = datetime.now()
+    date_str = now.strftime("%d/%m/%Y %H:%M:%S")
+    lines = [
+        _receipt_line(0,  "TKpay",              "C", "G"),
+        _receipt_line(2,  LINE_SEP,              "G", "S"),
+        _receipt_line(3,  date_str,              "G", "S"),
+        _receipt_line(4,  merchant_name,         "G", "S"),
+        _receipt_line(6,  merchant_city,         "G", "S"),
+        _receipt_line(7,  LINE_SEP,              "G", "S"),
+        _receipt_line(15, f"Terminal: {term_id}","G", "S"),
+        _receipt_line(19, f"STAN: {stan}",       "G", "S"),
+        _receipt_line(20, LINE_SEP,              "G", "S"),
+        _receipt_line(21, "TRANSACTION REFUSEE", "C", "G"),
+        _receipt_line(22, f"Code: {rc}",         "C", "S"),
+        _receipt_line(23, LINE_SEP,              "G", "S", last=True),
+    ]
+    return "".join(lines)
+
+
 def build_receipt(amount_centimes: int, stan: str, masked_card: str,
                   auth_num: str, ncai: str,
                   merchant_name: str = "TKPAY DEMO",
@@ -189,21 +212,22 @@ def _card_details(masked_card: str, entry_mode: str = "CC") -> str:
 def phase1_response(req: dict, mode: str, error_code: str,
                     peer: str = "") -> str:
     if mode == "decline":
-        base = _common_fields(req, "101", "005")
         stan = generate_stan()
-        return base + f("008", stan) + f("025", "REFUSE")
+        dp   = build_decline_receipt("005", stan)
+        return _common_fields(req, "101", "005") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
 
     if mode == "error":
-        base = _common_fields(req, "101", error_code)
-        return base + f("008", generate_stan())
+        stan = generate_stan()
+        dp   = build_decline_receipt(error_code, stan)
+        return _common_fields(req, "101", error_code) + f("008", stan) + f("010", dp)
 
     if mode == "interactive":
         amount = int(req.get("002", "0") or "0")
         approved = ask_operator(peer, amount)
         if not approved:
-            base = _common_fields(req, "101", "005")
             stan = generate_stan()
-            return base + f("008", stan) + f("025", "REFUSE")
+            dp   = build_decline_receipt("005", stan)
+            return _common_fields(req, "101", "005") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
 
     stan    = generate_stan()
     auth    = generate_approval()
