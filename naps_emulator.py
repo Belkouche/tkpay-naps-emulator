@@ -5,20 +5,29 @@ NAPS Pay M2M TLV Terminal Emulator
 Listens on TCP port 4444 and speaks the two-phase NAPS Pay M2M protocol.
 
 Usage:
-    python3 naps_emulator.py                     # approve all, port 4444
+    python3 naps_emulator.py                          # approve all, port 4444
     python3 naps_emulator.py --port 4445
     python3 naps_emulator.py --mode decline
-    python3 naps_emulator.py --mode timeout      # Phase-1 hangs (tests client timeout)
-    python3 naps_emulator.py --mode no_confirm   # Phase-2 hangs (tests 40-s confirmation timeout)
+    python3 naps_emulator.py --mode timeout           # Phase-1 hangs (tests client timeout)
+    python3 naps_emulator.py --mode no_confirm        # Phase-2 hangs (tests 40-s confirmation timeout)
     python3 naps_emulator.py --mode error --code 909
-    python3 naps_emulator.py --debug             # print every TLV field
+    python3 naps_emulator.py --mode error --code insufficient_funds
+    python3 naps_emulator.py --mode interactive       # prompt [a]pprove or pick a decline scenario
+    python3 naps_emulator.py --debug                  # print every TLV field
 
 Supported modes:
     approve      All payments approved (default)
     decline      Phase-1 returns RC=005 (declined)
     timeout      Phase-1 never responds
     no_confirm   Phase-2 never responds
-    error        Phase-1 returns the code supplied with --code
+    error        Phase-1 returns the code supplied with --code (name or number)
+    interactive  Prompt operator to approve or choose a decline scenario per payment
+
+Named scenarios for --code:
+    approved, insufficient_funds, expired_card, wrong_pin, pin_attempts_exceeded,
+    suspected_fraud, do_not_honour, card_not_active, transaction_not_allowed,
+    exceeds_limits, cancelled, already_cancelled, use_chip, pin_failed,
+    system_down, issuer_unavailable, server_error, record_not_found
 """
 
 import argparse
@@ -46,6 +55,55 @@ CHARSET      = "utf-8"
 LINE_SEP     = "--------------------------------"
 FS1          = "*"
 FS2          = "?"
+
+# ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
+
+SCENARIOS: dict[str, tuple[str, str]] = {
+    # name                  : (code, label)
+    "approved"              : ("000", "Approved"),
+    "do_not_honour"         : ("100", "Do not honour"),
+    "expired_card"          : ("101", "Expired card"),
+    "suspected_fraud"       : ("102", "Suspected fraud"),
+    "pin_attempts_exceeded" : ("106", "PIN attempts exceeded"),
+    "wrong_pin"             : ("117", "Wrong PIN"),
+    "insufficient_funds"    : ("116", "Insufficient funds"),
+    "card_not_active"       : ("118", "Card not active"),
+    "transaction_not_allowed": ("120", "Transaction not allowed at terminal"),
+    "exceeds_limits"        : ("121", "Exceeds withdrawal limits"),
+    "use_chip"              : ("265", "Please use chip"),
+    "cancelled"             : ("280", "Cancelled by cardholder"),
+    "pin_failed"            : ("281", "PIN verification failed"),
+    "record_not_found"      : ("302", "Record not found"),
+    "already_cancelled"     : ("482", "Transaction already cancelled"),
+    "system_down"           : ("909", "System failure"),
+    "issuer_unavailable"    : ("912", "Card issuer unavailable"),
+    "server_error"          : ("995", "Server processing error"),
+}
+
+# Ordered list for the interactive decline menu (most common first)
+DECLINE_MENU: list[str] = [
+    "insufficient_funds",
+    "wrong_pin",
+    "pin_attempts_exceeded",
+    "expired_card",
+    "suspected_fraud",
+    "do_not_honour",
+    "card_not_active",
+    "transaction_not_allowed",
+    "exceeds_limits",
+    "use_chip",
+    "pin_failed",
+    "system_down",
+    "issuer_unavailable",
+    "server_error",
+]
+
+
+def resolve_code(code: str) -> str:
+    """Resolve a scenario name or raw code string to a 3-digit RC."""
+    if code in SCENARIOS:
+        return SCENARIOS[code][0]
+    return code
 
 # ── TLV helpers ──────────────────────────────────────────────────────────────
 
@@ -217,17 +275,18 @@ def phase1_response(req: dict, mode: str, error_code: str,
         return _common_fields(req, "101", "005") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
 
     if mode == "error":
+        rc   = resolve_code(error_code)
         stan = generate_stan()
-        dp   = build_decline_receipt(error_code, stan)
-        return _common_fields(req, "101", error_code) + f("008", stan) + f("010", dp)
+        dp   = build_decline_receipt(rc, stan)
+        return _common_fields(req, "101", rc) + f("008", stan) + f("010", dp)
 
     if mode == "interactive":
-        amount = int(req.get("002", "0") or "0")
-        approved = ask_operator(peer, amount)
+        amount           = int(req.get("002", "0") or "0")
+        approved, rc     = ask_operator(peer, amount)
         if not approved:
             stan = generate_stan()
-            dp   = build_decline_receipt("005", stan)
-            return _common_fields(req, "101", "005") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
+            dp   = build_decline_receipt(rc, stan)
+            return _common_fields(req, "101", rc) + f("008", stan) + f("025", "REFUSE") + f("010", dp)
 
     stan    = generate_stan()
     auth    = generate_approval()
@@ -346,27 +405,52 @@ def _stdin_reader() -> None:
             _stdin_queue.put("a")
             break
 
-def ask_operator(peer: str, amount_centimes: int) -> bool:
+def ask_operator(peer: str, amount_centimes: int) -> tuple[bool, str]:
+    """
+    Prompt the operator to approve or pick a decline scenario.
+    Returns (approved: bool, response_code: str).
+    """
     amount_mad = amount_centimes / 100
     with _prompt_lock:
-        print(f"\n  ┌── Payment from {peer} ──")
+        print(f"\n  ┌── Payment from {peer} ──────────────────────────")
         print(f"  │  Amount : {amount_mad:.2f} MAD")
         print(f"  │  Card   : {MASKED_CARD}")
-        print(f"  └── [a] Approve   [d] Decline  → ", end="", flush=True)
+        print(f"  ├─────────────────────────────────────────────────")
+        print(f"  │  [a] Approve")
+        for i, name in enumerate(DECLINE_MENU, 1):
+            code, label = SCENARIOS[name]
+            print(f"  │  [{i:2d}] Decline — {label} ({code})")
+        print(f"  └─────────────────────────────────────────────────")
+        print(f"  Choice → ", end="", flush=True)
 
         while True:
             try:
                 answer = _stdin_queue.get(timeout=120)
             except queue.Empty:
                 print("(timeout → auto-approve)")
-                return True
+                return True, "000"
+
             if answer in ("a", "approve", "y", "yes", ""):
-                print("APPROVED")
-                return True
-            if answer in ("d", "decline", "n", "no"):
-                print("DECLINED")
-                return False
-            print(f"  Unknown input {answer!r} — type 'a' or 'd': ", end="", flush=True)
+                print("  → APPROVED")
+                return True, "000"
+
+            # Numeric index into decline menu
+            if answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(DECLINE_MENU):
+                    name = DECLINE_MENU[idx]
+                    code, label = SCENARIOS[name]
+                    print(f"  → DECLINED ({label} — {code})")
+                    return False, code
+
+            # Raw code or scenario name typed directly
+            resolved = resolve_code(answer)
+            if resolved != answer or (len(resolved) == 3 and resolved.isdigit()):
+                label = next((v[1] for v in SCENARIOS.values() if v[0] == resolved), resolved)
+                print(f"  → DECLINED ({label} — {resolved})")
+                return False, resolved
+
+            print(f"  Unknown input {answer!r} — type 'a', a number, or a code: ", end="", flush=True)
 
 
 # ── Client handler ────────────────────────────────────────────────────────────
@@ -539,11 +623,14 @@ def run_server(host: str, port: int, mode: str, error_code: str) -> None:
     print(f"  ├{'─'*w}┤")
     print(f"  │  {'Listening on':<14}{host}:{port:<{w-16}}│")
     print(f"  │  {'Mode':<14}{mode:<{w-14}}│")
-    if mode in ("decline", "error"):
-        rc = error_code if mode == "error" else "005"
-        print(f"  │  {'Response code':<14}{rc:<{w-14}}│")
+    if mode == "decline":
+        print(f"  │  {'Response code':<14}{'005 (decline)':<{w-14}}│")
+    if mode == "error":
+        rc    = resolve_code(error_code)
+        label = next((v[1] for v in SCENARIOS.values() if v[0] == rc), rc)
+        print(f"  │  {'Response code':<14}{rc} — {label:<{w-17}}│")
     if mode == "interactive":
-        print(f"  │  {'Prompt':<14}{'[a]pprove / [d]ecline per payment':<{w-14}}│")
+        print(f"  │  {'Prompt':<14}{'[a]pprove or pick decline scenario':<{w-14}}│")
     print(f"  └{'─'*w}┘")
     print()
     print("  Ctrl-C to stop\n")
@@ -580,7 +667,9 @@ def main() -> None:
         choices=["approve", "decline", "interactive", "timeout", "no_confirm", "error"],
         help="Response mode (default: approve). interactive = prompt [a]pprove/[d]ecline per payment",
     )
-    p.add_argument("--code",  default="909", help="RC for --mode error (default: 909)")
+    p.add_argument("--code",  default="909",
+                   help="RC for --mode error — numeric (e.g. 116) or scenario name "
+                        "(e.g. insufficient_funds). Default: 909")
     p.add_argument("--debug", action="store_true", help="Print all TLV fields")
     args = p.parse_args()
 

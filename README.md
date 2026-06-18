@@ -13,14 +13,16 @@ No dependencies — stdlib Python 3.10+ only.
 # Approve all payments (default)
 python3 naps_emulator.py
 
-# Operator prompted to approve/decline each payment interactively
+# Operator prompted to approve or pick a decline scenario per payment
 python3 naps_emulator.py --mode interactive
 
 # Decline all payments (RC=005)
 python3 naps_emulator.py --mode decline
 
-# Return a specific response code
+# Return a specific error code — numeric or named scenario
 python3 naps_emulator.py --mode error --code 909
+python3 naps_emulator.py --mode error --code insufficient_funds
+python3 naps_emulator.py --mode error --code expired_card
 
 # Phase-1 never responds — tests client read timeout
 python3 naps_emulator.py --mode timeout
@@ -85,28 +87,66 @@ The header line contains `"TKpay"` (bold, centred).
 
 | `--mode` | Phase-1 | Phase-2 | Use case |
 |---|---|---|---|
-| `approve` | RC=000 + full receipt | RC=000 + receipt | Normal flow |
-| `interactive` | Operator prompted per payment | RC=000 + receipt (if approved) | Manual approve/decline during demos |
-| `decline` | RC=005 + REFUSE | — | Card declined |
-| `error` | RC=`--code` | — | Specific error codes (909, 302, 482…) |
+| `approve` | RC=000 + full receipt | RC=000 + receipt | Normal happy path |
+| `interactive` | Operator prompted per payment | RC=000 + receipt (if approved) | Manual scenario selection during dev/demo |
+| `decline` | RC=005 + decline receipt | — | Generic card declined |
+| `error` | RC=`--code` + decline receipt | — | Specific error scenario |
 | `timeout` | Hangs forever | — | Test Phase-1 client timeout |
 | `no_confirm` | RC=000 | Hangs forever | Test 40-second Phase-2 timeout |
 
 ---
 
+## Test scenarios
+
+Pass a scenario name to `--code` or select it by number in interactive mode:
+
+| # | Name | Code | Description |
+|---|------|------|-------------|
+| 1 | `insufficient_funds` | 116 | Not enough balance |
+| 2 | `wrong_pin` | 117 | Incorrect PIN entered |
+| 3 | `pin_attempts_exceeded` | 106 | Too many wrong PIN attempts |
+| 4 | `expired_card` | 101 | Card past expiry date |
+| 5 | `suspected_fraud` | 102 | Fraud flag raised by issuer |
+| 6 | `do_not_honour` | 100 | Generic issuer refusal |
+| 7 | `card_not_active` | 118 | Card not yet activated |
+| 8 | `transaction_not_allowed` | 120 | Transaction type blocked at terminal |
+| 9 | `exceeds_limits` | 121 | Daily/weekly limit exceeded |
+| 10 | `use_chip` | 265 | Contactless refused — insert card |
+| 11 | `pin_failed` | 281 | PIN verification failed |
+| 12 | `system_down` | 909 | Terminal/server unreachable |
+| 13 | `issuer_unavailable` | 912 | Card issuer not responding |
+| 14 | `server_error` | 995 | NAPS server processing error |
+
+Examples:
+
+```bash
+python3 naps_emulator.py --mode error --code insufficient_funds
+python3 naps_emulator.py --mode error --code 116   # same thing
+```
+
+---
+
 ## Interactive mode
 
-In `--mode interactive` the terminal displays a prompt for each incoming Phase-1 request:
+In `--mode interactive` the emulator prompts for each Phase-1 request:
 
 ```
-  ┌── Payment from 127.0.0.1:52341 ──
+  ┌── Payment from 127.0.0.1:52341 ──────────────────────
   │  Amount : 150.00 MAD
   │  Card   : 516794******3315
-  └── [a] Approve   [d] Decline  → 
+  ├─────────────────────────────────────────────────────
+  │  [a] Approve
+  │  [ 1] Decline — Insufficient funds (116)
+  │  [ 2] Decline — Wrong PIN (117)
+  │  [ 3] Decline — PIN attempts exceeded (106)
+  │  ...
+  └─────────────────────────────────────────────────────
+  Choice →
 ```
 
-Type `a` (or `approve`, `y`, `yes`, or press Enter) to approve.
-Type `d` (or `decline`, `n`, `no`) to decline (RC=005).
+- Type `a` (or Enter) to approve
+- Type a number (e.g. `1`) to decline with that scenario
+- Type a raw code (e.g. `116`) or scenario name (e.g. `insufficient_funds`) directly
 
 If no answer arrives within 120 seconds the payment is auto-approved.
 Concurrent connections are serialised — one prompt at a time.
