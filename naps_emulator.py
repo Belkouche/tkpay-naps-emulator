@@ -216,10 +216,8 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
     now         = datetime.now()
     date_str    = now.strftime("%d/%m/%Y %H:%M:%S")
     amount_mad  = f"{amount_centimes / 100:.2f}"
-    label       = "DEBIT"
-    copy_label  = "Copie Client" if is_customer_copy else "Copie Commerçant"
-    footer1     = "devenezcommerçantNAPS" if is_customer_copy else "Conservez-moi, je peux être utile!"
-    footer2     = "APPELEZLE0522917474"  if is_customer_copy else "www.naps.ma"
+    label      = "DEBIT"
+    copy_label = "Copie Client" if is_customer_copy else "Copie Commerçant"
 
     lines = [
         _receipt_line(0,  "TKpay",                      "C", "G"),
@@ -239,9 +237,6 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
         _receipt_line(22, LINE_SEP,                     "G", "S"),
         _receipt_line(23, label,                        "G", "S"),
         _receipt_line(24, copy_label,                   "G", "S"),
-        _receipt_line(25, LINE_SEP,                     "G", "S"),
-        _receipt_line(26, footer1,                      "G", "S"),
-        _receipt_line(27, footer2,                      "G", "S"),
     ]
     return _join_lines(lines)
 
