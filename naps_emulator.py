@@ -179,6 +179,11 @@ def _receipt_line(line_num: int, content: str, align: str, style: str,
     )
 
 
+def _join_lines(lines: list) -> str:
+    """Join receipt lines with the '*' entry separator the SDK expects."""
+    return FS1.join(lines)
+
+
 def build_decline_receipt(rc: str, stan: str,
                           merchant_name: str = "TKPAY DEMO",
                           merchant_city: str = "CASABLANCA",
@@ -197,9 +202,9 @@ def build_decline_receipt(rc: str, stan: str,
         _receipt_line(20, LINE_SEP,              "G", "S"),
         _receipt_line(21, "TRANSACTION REFUSEE", "C", "G"),
         _receipt_line(22, f"Code: {rc}",         "C", "S"),
-        _receipt_line(23, LINE_SEP,              "G", "S", last=True),
+        _receipt_line(23, LINE_SEP,              "G", "S"),
     ]
-    return "".join(lines)
+    return _join_lines(lines)
 
 
 def build_receipt(amount_centimes: int, stan: str, masked_card: str,
@@ -236,9 +241,9 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
         _receipt_line(24, copy_label,                   "G", "S"),
         _receipt_line(25, LINE_SEP,                     "G", "S"),
         _receipt_line(26, footer1,                      "G", "S"),
-        _receipt_line(27, footer2,                      "G", "S", last=True),
+        _receipt_line(27, footer2,                      "G", "S"),
     ]
-    return "".join(lines)
+    return _join_lines(lines)
 
 
 # ── Response builders ─────────────────────────────────────────────────────────
@@ -341,9 +346,9 @@ def totals_response(req: dict) -> str:
         _receipt_line(7,  "ANNULATIONS:       0","G", "S"),
         _receipt_line(8,  LINE_SEP,              "G", "S"),
         _receipt_line(9,  "MONTANT:   0.00 MAD", "G", "S"),
-        _receipt_line(10, LINE_SEP,              "G", "S", last=True),
+        _receipt_line(10, LINE_SEP,              "G", "S"),
     ]
-    dp = "".join(lines)
+    dp = _join_lines(lines)
     return _common_fields(req, "110", "000") + f("010", dp)
 
 
@@ -373,9 +378,9 @@ def referencing_response(req: dict) -> str:
         _receipt_line(9,  LINE_SEP,              "G", "S"),
         _receipt_line(10, "TKPAY DEMO",          "G", "S"),
         _receipt_line(11, "CASABLANCA",           "G", "S"),
-        _receipt_line(12, LINE_SEP,              "G", "S", last=True),
+        _receipt_line(12, LINE_SEP,              "G", "S"),
     ]
-    dp = "".join(lines)
+    dp = _join_lines(lines)
     return _common_fields(req, "113", "000") + f("010", dp)
 
 
