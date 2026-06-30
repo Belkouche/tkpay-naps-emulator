@@ -28,6 +28,10 @@ Named scenarios for --code:
     suspected_fraud, do_not_honour, card_not_active, transaction_not_allowed,
     exceeds_limits, cancelled, already_cancelled, use_chip, pin_failed,
     system_down, issuer_unavailable, server_error, record_not_found
+
+Protocol notes:
+    Requests:  raw TLV, no terminator character
+    Responses: raw TLV + '?' end-of-message terminator
 """
 
 import argparse
@@ -50,11 +54,11 @@ log = logging.getLogger("naps-emulator")
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 PORT         = 4444
-READ_BUF     = 1024
+READ_BUF     = 4096
 CHARSET      = "utf-8"
 LINE_SEP     = "--------------------------------"
 FS1          = "*"
-FS2          = "?"
+RESPONSE_END = "?"   # appended to every response sent to client
 
 # ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
 
@@ -105,7 +109,7 @@ def resolve_code(code: str) -> str:
         return SCENARIOS[code][0]
     return code
 
-# ── TLV helpers ──────────────────────────────────────────────────────────────
+# ── TLV helpers ───────────────────────────────────────────────────────────────
 
 def _ascii(value: str) -> str:
     """Replace non-ASCII chars with ASCII equivalents to keep TLV byte-length == char-length."""
@@ -125,7 +129,11 @@ def f(tag: str, value: str) -> str:
 
 
 def parse(raw: str) -> dict[str, str]:
-    """Parse TLV string → {tag: value}."""
+    """
+    Parse TLV string → {tag: value}.
+    Requests arrive with no terminator; strip any stray '?' just in case.
+    """
+    raw = raw.rstrip("?")
     out: dict[str, str] = {}
     i = 0
     while i + 6 <= len(raw):
@@ -139,6 +147,22 @@ def parse(raw: str) -> dict[str, str]:
         out[tag] = raw[i+6:i+6+n]
         i += 6 + n
     return out
+
+
+def _is_complete(raw: str) -> bool:
+    """
+    Return True when `raw` contains a fully-formed TLV message.
+    Walks the TLV chain and checks that all length fields are satisfied.
+    Requests carry no terminator, so we rely on the TLV structure itself.
+    """
+    i = 0
+    while i + 6 <= len(raw):
+        try:
+            n = int(raw[i+3:i+6])
+        except ValueError:
+            return False
+        i += 6 + n
+    return i == len(raw) and i > 0
 
 
 def dump(fields: dict[str, str]) -> str:
@@ -168,8 +192,7 @@ TM_NAMES = {
 
 # ── Receipt builder ───────────────────────────────────────────────────────────
 
-def _receipt_line(line_num: int, content: str, align: str, style: str,
-                  last: bool = False) -> str:
+def _receipt_line(line_num: int, content: str, align: str, style: str) -> str:
     content = _ascii(content)
     return (
         "030002" + f"{line_num:02d}" +
@@ -191,18 +214,18 @@ def build_decline_receipt(rc: str, stan: str,
     now      = datetime.now()
     date_str = now.strftime("%d/%m/%Y %H:%M:%S")
     lines = [
-        _receipt_line(0,  "TKpay",              "C", "G"),
-        _receipt_line(2,  LINE_SEP,              "G", "S"),
-        _receipt_line(3,  date_str,              "G", "S"),
-        _receipt_line(4,  merchant_name,         "G", "S"),
-        _receipt_line(6,  merchant_city,         "G", "S"),
-        _receipt_line(7,  LINE_SEP,              "G", "S"),
-        _receipt_line(15, f"Terminal: {term_id}","G", "S"),
-        _receipt_line(19, f"STAN: {stan}",       "G", "S"),
-        _receipt_line(20, LINE_SEP,              "G", "S"),
-        _receipt_line(21, "TRANSACTION REFUSEE", "C", "G"),
-        _receipt_line(22, f"Code: {rc}",         "C", "S"),
-        _receipt_line(23, LINE_SEP,              "G", "S"),
+        _receipt_line(0,  "TKpay",               "C", "G"),
+        _receipt_line(2,  LINE_SEP,               "G", "S"),
+        _receipt_line(3,  date_str,               "G", "S"),
+        _receipt_line(4,  merchant_name,          "G", "S"),
+        _receipt_line(6,  merchant_city,          "G", "S"),
+        _receipt_line(7,  LINE_SEP,               "G", "S"),
+        _receipt_line(15, f"Terminal: {term_id}", "G", "S"),
+        _receipt_line(19, f"STAN: {stan}",        "G", "S"),
+        _receipt_line(20, LINE_SEP,               "G", "S"),
+        _receipt_line(21, "TRANSACTION REFUSEE",  "C", "G"),
+        _receipt_line(22, f"Code: {rc}",          "C", "S"),
+        _receipt_line(23, LINE_SEP,               "G", "S"),
     ]
     return _join_lines(lines)
 
@@ -216,27 +239,26 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
     now         = datetime.now()
     date_str    = now.strftime("%d/%m/%Y %H:%M:%S")
     amount_mad  = f"{amount_centimes / 100:.2f}"
-    label      = "DEBIT"
-    copy_label = "Copie Client" if is_customer_copy else "Copie Commerçant"
+    copy_label  = "Copie Client" if is_customer_copy else "Copie Commercant"
 
     lines = [
-        _receipt_line(0,  "TKpay",                      "C", "G"),
-        _receipt_line(2,  LINE_SEP,                     "G", "S"),
-        _receipt_line(3,  date_str,                     "G", "S"),
-        _receipt_line(4,  merchant_name,                "G", "S"),
-        _receipt_line(6,  merchant_city,                "G", "S"),
-        _receipt_line(7,  LINE_SEP,                     "G", "S"),
-        _receipt_line(9,  "VISA",                       "G", "S"),
-        _receipt_line(10, masked_card,                  "G", "S"),
-        _receipt_line(15, f"Terminal: {term_id}",       "G", "S"),
-        _receipt_line(17, f"Transaction: {stan}",       "G", "S"),
-        _receipt_line(18, f"Autorisation: {auth_num}",  "G", "S"),
-        _receipt_line(19, f"STAN: {stan}",              "G", "S"),
-        _receipt_line(20, LINE_SEP,                     "G", "S"),
-        _receipt_line(21, f"MONTANT: {amount_mad} MAD", "G", "S"),
-        _receipt_line(22, LINE_SEP,                     "G", "S"),
-        _receipt_line(23, label,                        "G", "S"),
-        _receipt_line(24, copy_label,                   "G", "S"),
+        _receipt_line(0,  "TKpay",                       "C", "G"),
+        _receipt_line(2,  LINE_SEP,                      "G", "S"),
+        _receipt_line(3,  date_str,                      "G", "S"),
+        _receipt_line(4,  merchant_name,                 "G", "S"),
+        _receipt_line(6,  merchant_city,                 "G", "S"),
+        _receipt_line(7,  LINE_SEP,                      "G", "S"),
+        _receipt_line(9,  "VISA",                        "G", "S"),
+        _receipt_line(10, masked_card,                   "G", "S"),
+        _receipt_line(15, f"Terminal: {term_id}",        "G", "S"),
+        _receipt_line(17, f"Transaction: {stan}",        "G", "S"),
+        _receipt_line(18, f"Autorisation: {auth_num}",   "G", "S"),
+        _receipt_line(19, f"STAN: {stan}",               "G", "S"),
+        _receipt_line(20, LINE_SEP,                      "G", "S"),
+        _receipt_line(21, f"MONTANT: {amount_mad} MAD",  "G", "S"),
+        _receipt_line(22, LINE_SEP,                      "G", "S"),
+        _receipt_line(23, "DEBIT",                       "G", "S"),
+        _receipt_line(24, copy_label,                    "G", "S"),
     ]
     return _join_lines(lines)
 
@@ -332,16 +354,16 @@ def totals_response(req: dict) -> str:
     now       = datetime.now()
     date_str  = now.strftime("%d/%m/%Y %H:%M:%S")
     lines = [
-        _receipt_line(0,  "TKpay",              "C", "G"),
-        _receipt_line(2,  LINE_SEP,              "G", "S"),
-        _receipt_line(3,  date_str,              "G", "S"),
-        _receipt_line(4,  "TOTAUX DU JOUR",      "C", "G"),
-        _receipt_line(5,  LINE_SEP,              "G", "S"),
-        _receipt_line(6,  "VENTES:     0000000", "G", "S"),
-        _receipt_line(7,  "ANNULATIONS:       0","G", "S"),
-        _receipt_line(8,  LINE_SEP,              "G", "S"),
-        _receipt_line(9,  "MONTANT:   0.00 MAD", "G", "S"),
-        _receipt_line(10, LINE_SEP,              "G", "S"),
+        _receipt_line(0,  "TKpay",               "C", "G"),
+        _receipt_line(2,  LINE_SEP,               "G", "S"),
+        _receipt_line(3,  date_str,               "G", "S"),
+        _receipt_line(4,  "TOTAUX DU JOUR",       "C", "G"),
+        _receipt_line(5,  LINE_SEP,               "G", "S"),
+        _receipt_line(6,  "VENTES:     0000000",  "G", "S"),
+        _receipt_line(7,  "ANNULATIONS:       0", "G", "S"),
+        _receipt_line(8,  LINE_SEP,               "G", "S"),
+        _receipt_line(9,  "MONTANT:   0.00 MAD",  "G", "S"),
+        _receipt_line(10, LINE_SEP,               "G", "S"),
     ]
     dp = _join_lines(lines)
     return _common_fields(req, "110", "000") + f("010", dp)
@@ -363,17 +385,17 @@ def referencing_response(req: dict) -> str:
     date_str = now.strftime("%d/%m/%Y %H:%M:%S")
     lines = [
         _receipt_line(0,  "TKpay",              "C", "G"),
-        _receipt_line(2,  LINE_SEP,              "G", "S"),
-        _receipt_line(3,  date_str,              "G", "S"),
-        _receipt_line(4,  "PARAMETRES",          "C", "G"),
-        _receipt_line(5,  LINE_SEP,              "G", "S"),
-        _receipt_line(6,  "MID: 000000000001",   "G", "S"),
-        _receipt_line(7,  "TID: 00000001",       "G", "S"),
-        _receipt_line(8,  "DEVISE: MAD (504)",   "G", "S"),
-        _receipt_line(9,  LINE_SEP,              "G", "S"),
-        _receipt_line(10, "TKPAY DEMO",          "G", "S"),
-        _receipt_line(11, "CASABLANCA",           "G", "S"),
-        _receipt_line(12, LINE_SEP,              "G", "S"),
+        _receipt_line(2,  LINE_SEP,             "G", "S"),
+        _receipt_line(3,  date_str,             "G", "S"),
+        _receipt_line(4,  "PARAMETRES",         "C", "G"),
+        _receipt_line(5,  LINE_SEP,             "G", "S"),
+        _receipt_line(6,  "MID: 000000000001",  "G", "S"),
+        _receipt_line(7,  "TID: 00000001",      "G", "S"),
+        _receipt_line(8,  "DEVISE: MAD (504)",  "G", "S"),
+        _receipt_line(9,  LINE_SEP,             "G", "S"),
+        _receipt_line(10, "TKPAY DEMO",         "G", "S"),
+        _receipt_line(11, "CASABLANCA",         "G", "S"),
+        _receipt_line(12, LINE_SEP,             "G", "S"),
     ]
     dp = _join_lines(lines)
     return _common_fields(req, "113", "000") + f("010", dp)
@@ -434,7 +456,6 @@ def ask_operator(peer: str, amount_centimes: int) -> tuple[bool, str]:
                 print("  → APPROVED")
                 return True, "000"
 
-            # Numeric index into decline menu
             if answer.isdigit():
                 idx = int(answer) - 1
                 if 0 <= idx < len(DECLINE_MENU):
@@ -443,7 +464,6 @@ def ask_operator(peer: str, amount_centimes: int) -> tuple[bool, str]:
                     print(f"  → DECLINED ({label} — {code})")
                     return False, code
 
-            # Raw code or scenario name typed directly
             resolved = resolve_code(answer)
             if resolved != answer or (len(resolved) == 3 and resolved.isdigit()):
                 label = next((v[1] for v in SCENARIOS.values() if v[0] == resolved), resolved)
@@ -458,35 +478,50 @@ def ask_operator(peer: str, amount_centimes: int) -> tuple[bool, str]:
 def recv_message(conn: socket.socket) -> bytes:
     """
     Read a complete TLV message from the socket.
-    Uses a 200 ms inter-chunk gap to detect end-of-message (the terminal
-    keeps the connection open between phases).
+
+    Requests arrive with NO terminator character (raw TLV only).
+    We use TLV-structure validation to detect a complete message, with a
+    200 ms inter-chunk gap as a fallback for any edge case.
     """
     data = b""
+    conn.settimeout(180)
+
     while True:
         try:
             chunk = conn.recv(READ_BUF)
-            if not chunk:
-                break
-            data += chunk
-            if len(chunk) < READ_BUF:
-                conn.settimeout(0.2)
-                try:
-                    more = conn.recv(READ_BUF)
-                    if more:
-                        data += more
-                except (socket.timeout, BlockingIOError):
-                    pass
-                finally:
-                    conn.settimeout(None)
-                break
         except socket.timeout:
             break
+        if not chunk:
+            break
+        data += chunk
+
+        # Check if the accumulated bytes form a complete TLV message
+        try:
+            text = data.decode(CHARSET, errors="replace")
+            if _is_complete(text):
+                break
+        except Exception:
+            pass
+
+        # Fallback: short gap with no more data → treat as end-of-message
+        conn.settimeout(0.2)
+        try:
+            more = conn.recv(READ_BUF)
+            if more:
+                data += more
+            else:
+                break
+        except (socket.timeout, BlockingIOError):
+            break
+        finally:
+            conn.settimeout(180)
+
     return data
 
 
 def send(conn: socket.socket, resp: str, charset: str) -> None:
     """Send a response, appending '?' as end-of-message terminator."""
-    conn.sendall((resp + FS2).encode(charset))
+    conn.sendall((resp + RESPONSE_END).encode(charset))
 
 
 def handle_client(conn: socket.socket, addr: tuple,
@@ -494,18 +529,12 @@ def handle_client(conn: socket.socket, addr: tuple,
     peer = f"{addr[0]}:{addr[1]}"
     log.info(f"[{peer}] connected")
 
-    conn.settimeout(180)
-
     current_stan:   str | None = None
     current_amount: int       = 0
 
     try:
         while True:
-            try:
-                raw_bytes = recv_message(conn)
-            except socket.timeout:
-                log.info(f"[{peer}] idle timeout")
-                break
+            raw_bytes = recv_message(conn)
 
             if not raw_bytes:
                 log.info(f"[{peer}] disconnected")
