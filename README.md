@@ -50,7 +50,7 @@ Your SDK / Client            Emulator (port 4444)
 
 The emulator keeps the TCP connection open after each response, exactly like the real terminal. Phase-2 can arrive on the same or a new connection.
 
-**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with `?` as the end-of-message terminator.
+**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with `?` as the end-of-message terminator. The SDK parses at the first `?` — everything after it is ignored.
 
 ---
 
