@@ -31,8 +31,10 @@ Named scenarios for --code:
 
 Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
     Requests:  raw TLV, no terminator character
-    Responses: raw TLV + '!' end-of-message terminator
-               (v5.4.4 changed this from '?' → '!'; the SDK reads until '!')
+    Responses: raw TLV + end-of-message terminator, selected by --protocol:
+                 v2 (default, v5.4.4+): '!'      — SDK reads until '!'
+                 v1 (pre-v5.4.4):       '?'      — legacy terminals
+               e.g.  python3 naps_emulator.py --protocol v1
     Confirmation (TM 002): the SDK echoes MT/DE/NCAR/DAEX from the payment
                response per spec §4.2 — the emulator verifies these against the
                approved payment and can reject a mismatch (see --strict-confirm).
@@ -63,6 +65,10 @@ CHARSET      = "utf-8"
 LINE_SEP     = "--------------------------------"
 FS1          = "*"
 RESPONSE_END = "!"   # NapsPay v5.4.4 terminates TCP responses with '!' (was '?' pre-v5.4.4)
+
+# Response terminator per NAPS protocol generation. v1 (pre-v5.4.4) used '?';
+# v2 (v5.4.4+, matches Aslan.Naps SDK v1.0.8) uses '!'. Requests never carry one.
+PROTOCOL_TERMINATORS = {"v1": "?", "v2": "!"}
 
 # ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
 
@@ -569,13 +575,14 @@ def recv_message(conn: socket.socket) -> bytes:
     return data
 
 
-def send(conn: socket.socket, resp: str, charset: str) -> None:
-    """Send a response, appending '?' as end-of-message terminator."""
-    conn.sendall((resp + RESPONSE_END).encode(charset))
+def send(conn: socket.socket, resp: str, charset: str, terminator: str = RESPONSE_END) -> None:
+    """Send a response, appending the end-of-message terminator ('!' v2, '?' v1)."""
+    conn.sendall((resp + terminator).encode(charset))
 
 
 def handle_client(conn: socket.socket, addr: tuple,
-                  mode: str, error_code: str, strict_confirm: bool = False) -> None:
+                  mode: str, error_code: str, strict_confirm: bool = False,
+                  terminator: str = RESPONSE_END) -> None:
     peer = f"{addr[0]}:{addr[1]}"
     log.info(f"[{peer}] connected")
 
@@ -613,7 +620,7 @@ def handle_client(conn: socket.socket, addr: tuple,
                 current_stan   = stan
                 current_amount = int(fields.get("002", "0") or "0")
                 log.info(f"[{peer}] Phase-1 → RC={rc}  STAN={stan}")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=002  Confirmation ──────────────────────────────────────────
             elif tm == "002":
@@ -633,11 +640,11 @@ def handle_client(conn: socket.socket, addr: tuple,
                 if mismatch:
                     resp = phase2_coherence_reject(fields, mismatch)
                     log.info(f"[{peer}] Phase-2 → RC=307 (coherence reject: {mismatch})")
-                    send(conn, resp, CHARSET)
+                    send(conn, resp, CHARSET, terminator)
                 else:
                     resp = phase2_response(fields, stan_to_use, current_amount)
                     log.info(f"[{peer}] Phase-2 → RC=000  STAN={stan_to_use}")
-                    send(conn, resp, CHARSET)
+                    send(conn, resp, CHARSET, terminator)
                     log.info(f"[{peer}] transaction complete")
                 current_stan   = None
                 current_amount = 0
@@ -647,38 +654,38 @@ def handle_client(conn: socket.socket, addr: tuple,
                 stan = fields.get("008", "?")
                 resp = cancellation_response(fields)
                 log.info(f"[{peer}] Cancellation → RC=000  STAN={stan}")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
                 current_stan = None
 
             # ── TM=008  Duplicate receipt ─────────────────────────────────────
             elif tm == "008":
                 resp = duplicate_response(fields, current_stan)
                 log.info(f"[{peer}] Duplicate receipt → RC=000")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=009  Network test ──────────────────────────────────────────
             elif tm == "009":
                 resp = network_test_response(fields)
                 log.info(f"[{peer}] Network test → RC=000")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=010  Totals ────────────────────────────────────────────────
             elif tm == "010":
                 resp = totals_response(fields)
                 log.info(f"[{peer}] Totals → RC=000")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=012  Reset PinPAD ──────────────────────────────────────────
             elif tm == "012":
                 resp = reset_response(fields)
                 log.info(f"[{peer}] Reset PinPAD → RC=000")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=013  Referencing ───────────────────────────────────────────
             elif tm == "013":
                 resp = referencing_response(fields)
                 log.info(f"[{peer}] Referencing → RC=000")
-                send(conn, resp, CHARSET)
+                send(conn, resp, CHARSET, terminator)
 
             else:
                 log.warning(f"[{peer}] unhandled TM={tm!r}, ignoring")
@@ -696,7 +703,8 @@ def handle_client(conn: socket.socket, addr: tuple,
 # ── Server ────────────────────────────────────────────────────────────────────
 
 def run_server(host: str, port: int, mode: str, error_code: str,
-               strict_confirm: bool = False) -> None:
+               strict_confirm: bool = False, protocol: str = "v2") -> None:
+    terminator = PROTOCOL_TERMINATORS[protocol]
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -725,7 +733,8 @@ def run_server(host: str, port: int, mode: str, error_code: str,
         print(f"  │  {'Prompt':<14}{'[a]pprove or pick decline scenario':<{w-14}}│")
     if strict_confirm:
         print(f"  │  {'Confirm':<14}{'strict §4.2 coherence (MT/NCAR)':<{w-14}}│")
-    print(f"  │  {'Terminator':<14}{chr(39)+RESPONSE_END+chr(39)+' (v5.4.4)':<{w-14}}│")
+    proto_label = f"{protocol} ({chr(39)}{terminator}{chr(39)}{' v5.4.4' if protocol == 'v2' else ' legacy'})"
+    print(f"  │  {'Protocol':<14}{proto_label:<{w-14}}│")
     print(f"  └{'─'*w}┘")
     print()
     print("  Ctrl-C to stop\n")
@@ -738,7 +747,7 @@ def run_server(host: str, port: int, mode: str, error_code: str,
             conn, addr = srv.accept()
             threading.Thread(
                 target=handle_client,
-                args=(conn, addr, mode, error_code, strict_confirm),
+                args=(conn, addr, mode, error_code, strict_confirm, terminator),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
@@ -768,13 +777,16 @@ def main() -> None:
     p.add_argument("--strict-confirm", action="store_true",
                    help="Reject the confirmation (TM 002, RC=307) when its echoed "
                         "MT/NCAR disagree with the approved payment (spec §4.2).")
+    p.add_argument("--protocol", default="v2", choices=["v1", "v2"],
+                   help="NAPS TLV generation: v1 terminates responses with '?' "
+                        "(pre-v5.4.4), v2 with '!' (v5.4.4+, default).")
     p.add_argument("--debug", action="store_true", help="Print all TLV fields")
     args = p.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    run_server(args.host, args.port, args.mode, args.code, args.strict_confirm)
+    run_server(args.host, args.port, args.mode, args.code, args.strict_confirm, args.protocol)
 
 
 if __name__ == "__main__":

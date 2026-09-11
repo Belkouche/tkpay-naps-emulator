@@ -36,6 +36,10 @@ python3 naps_emulator.py --mode no_confirm
 # echoed MT/NCAR disagree with the approved payment
 python3 naps_emulator.py --strict-confirm
 
+# Select the NAPS TLV generation (response terminator):
+python3 naps_emulator.py --protocol v2   # '!' terminator (v5.4.4+, default)
+python3 naps_emulator.py --protocol v1   # '?' terminator (legacy, pre-v5.4.4)
+
 # Different port + verbose TLV field logging
 python3 naps_emulator.py --port 4445 --debug
 ```
@@ -56,7 +60,7 @@ Your SDK / Client            Emulator (port 4444)
 
 The emulator keeps the TCP connection open after each response, exactly like the real terminal. Phase-2 can arrive on the same or a new connection.
 
-**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with **`!`** as the end-of-message terminator (NapsPay v5.4.4 changed this from `?` → `!`; the SDK reads until `!`). Everything after the `!` is ignored.
+**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with an end-of-message terminator selected by `--protocol`: **`!`** for `v2` (NapsPay v5.4.4+, default) or **`?`** for `v1` (legacy). Everything after the terminator is ignored. Use `--protocol v1` to emulate a pre-v5.4.4 terminal.
 
 **Confirmation coherence (spec §4.2):** SDK v1.0.8 echoes `MT/DE/NCAR/DAEX` from the approved payment into the confirmation (TM 002) so the terminal can reinforce coherence checks. The emulator logs these fields, and with `--strict-confirm` it rejects the confirmation with `RC=307` when the echoed `MT` or `NCAR` disagree with the approved payment.
 
