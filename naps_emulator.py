@@ -17,7 +17,7 @@ Usage:
 
 Supported modes:
     approve      All payments approved (default)
-    decline      Phase-1 returns RC=005 (declined)
+    decline      Phase-1 returns RC=100 (do not honour)
     timeout      Phase-1 never responds
     no_confirm   Phase-2 never responds
     error        Phase-1 returns the code supplied with --code (name or number)
@@ -29,9 +29,13 @@ Named scenarios for --code:
     exceeds_limits, cancelled, already_cancelled, use_chip, pin_failed,
     system_down, issuer_unavailable, server_error, record_not_found
 
-Protocol notes:
+Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
     Requests:  raw TLV, no terminator character
-    Responses: raw TLV + '?' end-of-message terminator
+    Responses: raw TLV + '!' end-of-message terminator
+               (v5.4.4 changed this from '?' → '!'; the SDK reads until '!')
+    Confirmation (TM 002): the SDK echoes MT/DE/NCAR/DAEX from the payment
+               response per spec §4.2 — the emulator verifies these against the
+               approved payment and can reject a mismatch (see --strict-confirm).
 """
 
 import argparse
@@ -58,26 +62,27 @@ READ_BUF     = 4096
 CHARSET      = "utf-8"
 LINE_SEP     = "--------------------------------"
 FS1          = "*"
-RESPONSE_END = "?"   # appended to every response sent to client
+RESPONSE_END = "!"   # NapsPay v5.4.4 terminates TCP responses with '!' (was '?' pre-v5.4.4)
 
 # ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
 
+# Codes and labels track the TLV Protocol Specification v2.0 §6 response-code
+# table (mirrored by LtvProtocol.ResponseCodes in Aslan.Naps SDK v1.0.8).
 SCENARIOS: dict[str, tuple[str, str]] = {
     # name                  : (code, label)
     "approved"              : ("000", "Approved"),
     "do_not_honour"         : ("100", "Do not honour"),
-    "expired_card"          : ("101", "Expired card"),
-    "suspected_fraud"       : ("102", "Suspected fraud"),
-    "pin_attempts_exceeded" : ("106", "PIN attempts exceeded"),
-    "wrong_pin"             : ("117", "Wrong PIN"),
+    "expired_card"          : ("101", "Card expired"),
+    "suspected_fraud"       : ("102", "Fraud suspected"),
+    "pin_attempts_exceeded" : ("106", "Allowed PIN tries exceeded"),
+    "wrong_pin"             : ("117", "Incorrect PIN"),
     "insufficient_funds"    : ("116", "Insufficient funds"),
-    "card_not_active"       : ("118", "Card not active"),
-    "transaction_not_allowed": ("120", "Transaction not allowed at terminal"),
-    "exceeds_limits"        : ("121", "Exceeds withdrawal limits"),
-    "use_chip"              : ("265", "Please use chip"),
-    "cancelled"             : ("280", "Cancelled by cardholder"),
-    "pin_failed"            : ("281", "PIN verification failed"),
-    "record_not_found"      : ("302", "Record not found"),
+    "card_not_active"       : ("118", "Card not registered"),
+    "transaction_not_allowed": ("120", "Transaction not permitted at terminal"),
+    "exceeds_limits"        : ("121", "Withdrawal limit exceeded"),
+    "invalid_cvv"           : ("183", "Invalid CVV"),
+    "cancelled"             : ("280", "Alternative amount cancelled"),
+    "record_not_found"      : ("302", "Record not found on file"),
     "already_cancelled"     : ("482", "Transaction already cancelled"),
     "system_down"           : ("909", "System failure"),
     "issuer_unavailable"    : ("912", "Card issuer unavailable"),
@@ -95,8 +100,7 @@ DECLINE_MENU: list[str] = [
     "card_not_active",
     "transaction_not_allowed",
     "exceeds_limits",
-    "use_chip",
-    "pin_failed",
+    "invalid_cvv",
     "system_down",
     "issuer_unavailable",
     "server_error",
@@ -131,9 +135,9 @@ def f(tag: str, value: str) -> str:
 def parse(raw: str) -> dict[str, str]:
     """
     Parse TLV string → {tag: value}.
-    Requests arrive with no terminator; strip any stray '?' just in case.
+    Requests arrive with no terminator; strip any stray terminator just in case.
     """
-    raw = raw.rstrip("?")
+    raw = raw.rstrip("!?")
     out: dict[str, str] = {}
     i = 0
     while i + 6 <= len(raw):
@@ -169,9 +173,10 @@ def dump(fields: dict[str, str]) -> str:
     NAMES = {
         "001":"TM",  "002":"MT",   "003":"NCAI","004":"NS",
         "005":"NSA", "007":"NCAR", "008":"STAN","009":"NA",
-        "010":"DP",  "012":"DE",   "013":"CR",  "014":"DA",
-        "015":"HE",  "016":"NPRT", "017":"DAEX","018":"DATR",
-        "019":"HETR","025":"RESE", "040":"EM",
+        "010":"DP",  "011":"CB",   "012":"DE",  "013":"CR",
+        "014":"DA",  "015":"HE",   "016":"NPRT","017":"DAEX",
+        "018":"DATR","019":"HETR", "020":"TIDE","025":"RESE",
+        "040":"EM",
     }
     return "\n".join(
         f"    {tag} ({NAMES.get(tag, tag):6s}) = {val!r}"
@@ -293,8 +298,8 @@ def phase1_response(req: dict, mode: str, error_code: str,
                     peer: str = "") -> str:
     if mode == "decline":
         stan = generate_stan()
-        dp   = build_decline_receipt("005", stan)
-        return _common_fields(req, "101", "005") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
+        dp   = build_decline_receipt("100", stan)
+        return _common_fields(req, "101", "100") + f("008", stan) + f("025", "REFUSE") + f("010", dp)
 
     if mode == "error":
         rc   = resolve_code(error_code)
@@ -324,6 +329,26 @@ def phase1_response(req: dict, mode: str, error_code: str,
     )
 
 
+def confirmation_coherence_error(req: dict, phase1_amount: int) -> str | None:
+    """
+    Spec §4.2: the confirmation (TM 002) echoes MT/DE/NCAR/DAEX from the approved
+    payment so the terminal can reinforce coherence checks. Return a mismatch
+    description if the echoed fields disagree with the approved payment, else None.
+    Only MT and NCAR are checked here (DE is fixed to MAD; DAEX is informational).
+
+    The MT check is skipped when no phase-1 amount was recorded on this connection
+    (phase1_amount == 0) — there is nothing to compare against, so a standalone
+    confirmation is not treated as a mismatch.
+    """
+    conf_mt = req.get("002")
+    if conf_mt is not None and phase1_amount > 0 and int(conf_mt or "0") != phase1_amount:
+        return f"MT mismatch: confirmation={conf_mt} vs payment={phase1_amount}"
+    conf_ncar = req.get("007")
+    if conf_ncar is not None and conf_ncar != MASKED_CARD:
+        return f"NCAR mismatch: confirmation={conf_ncar} vs payment={MASKED_CARD}"
+    return None
+
+
 def phase2_response(req: dict, phase1_stan: str, phase1_amount: int) -> str:
     stan   = phase1_stan
     ncai   = req.get("003", "0100001")
@@ -338,10 +363,27 @@ def phase2_response(req: dict, phase1_stan: str, phase1_amount: int) -> str:
     )
 
 
+def phase2_coherence_reject(req: dict, reason: str) -> str:
+    """TM=102 with CR=307 (Format error) when strict-confirm coherence fails."""
+    log.warning(f"  strict-confirm: {reason}")
+    return _common_fields(req, "102", "307") + f("008", req.get("008", "000000"))
+
+
 def cancellation_response(req: dict) -> str:
-    """TM=003 → TM=103  RC=000 (void accepted)."""
+    """
+    TM=003 → TM=103  RC=000 (void accepted).
+    v5.4.4: the SDK sends MT (002) in the cancel frame; echo it back along with
+    the original transaction date/time (DATR/HETR) the SDK maps to
+    OriginalTransactionDate/Time. The SDK accepts MT 103 or 104 with RC=000.
+    """
+    now  = datetime.now()
     stan = req.get("008", generate_stan())
-    return _common_fields(req, "103", "000") + f("008", stan)
+    resp = _common_fields(req, "103", "000") + f("008", stan)
+    # Echo the original amount if supplied, plus original-transaction timestamps.
+    if req.get("002"):
+        resp += f("002", req["002"])
+    resp += f("018", now.strftime("%d%m%Y")) + f("019", now.strftime("%H%M%S"))
+    return resp
 
 
 def network_test_response(req: dict) -> str:
@@ -380,14 +422,21 @@ def duplicate_response(req: dict, last_stan: str | None) -> str:
 
 
 def referencing_response(req: dict) -> str:
-    """TM=013 → TM=113  RC=000 with basic merchant config receipt."""
+    """
+    TM=013 → TM=113  RC=000 with a parameter-load receipt.
+    TIDE (020) selects the parameter set: 01=Merchant (default), 02=Recharge.
+    The response echoes TIDE per spec §4.8.
+    """
     now      = datetime.now()
     date_str = now.strftime("%d/%m/%Y %H:%M:%S")
+    tide     = req.get("020", "01")
+    is_recharge = tide == "02"
+    heading  = "PARAMETRES RECHARGE" if is_recharge else "PARAMETRES MARCHAND"
     lines = [
         _receipt_line(0,  "TKpay",              "C", "G"),
         _receipt_line(2,  LINE_SEP,             "G", "S"),
         _receipt_line(3,  date_str,             "G", "S"),
-        _receipt_line(4,  "PARAMETRES",         "C", "G"),
+        _receipt_line(4,  heading,              "C", "G"),
         _receipt_line(5,  LINE_SEP,             "G", "S"),
         _receipt_line(6,  "MID: 000000000001",  "G", "S"),
         _receipt_line(7,  "TID: 00000001",      "G", "S"),
@@ -398,7 +447,8 @@ def referencing_response(req: dict) -> str:
         _receipt_line(12, LINE_SEP,             "G", "S"),
     ]
     dp = _join_lines(lines)
-    return _common_fields(req, "113", "000") + f("010", dp)
+    # Echo TIDE (020) so the SDK sees which parameter set was loaded.
+    return _common_fields(req, "113", "000") + f("020", tide) + f("010", dp)
 
 
 def reset_response(req: dict) -> str:
@@ -525,7 +575,7 @@ def send(conn: socket.socket, resp: str, charset: str) -> None:
 
 
 def handle_client(conn: socket.socket, addr: tuple,
-                  mode: str, error_code: str) -> None:
+                  mode: str, error_code: str, strict_confirm: bool = False) -> None:
     peer = f"{addr[0]}:{addr[1]}"
     log.info(f"[{peer}] connected")
 
@@ -573,10 +623,22 @@ def handle_client(conn: socket.socket, addr: tuple,
                     break
 
                 stan_to_use = current_stan or fields.get("008", generate_stan())
-                resp = phase2_response(fields, stan_to_use, current_amount)
-                log.info(f"[{peer}] Phase-2 → RC=000  STAN={stan_to_use}")
-                send(conn, resp, CHARSET)
-                log.info(f"[{peer}] transaction complete")
+
+                # Log the §4.2 coherence fields the SDK v1.0.8 now echoes.
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(f"[{peer}] confirmation echoes: MT={fields.get('002')} "
+                              f"DE={fields.get('012')} NCAR={fields.get('007')} DAEX={fields.get('017')}")
+
+                mismatch = confirmation_coherence_error(fields, current_amount) if strict_confirm else None
+                if mismatch:
+                    resp = phase2_coherence_reject(fields, mismatch)
+                    log.info(f"[{peer}] Phase-2 → RC=307 (coherence reject: {mismatch})")
+                    send(conn, resp, CHARSET)
+                else:
+                    resp = phase2_response(fields, stan_to_use, current_amount)
+                    log.info(f"[{peer}] Phase-2 → RC=000  STAN={stan_to_use}")
+                    send(conn, resp, CHARSET)
+                    log.info(f"[{peer}] transaction complete")
                 current_stan   = None
                 current_amount = 0
 
@@ -633,7 +695,8 @@ def handle_client(conn: socket.socket, addr: tuple,
 
 # ── Server ────────────────────────────────────────────────────────────────────
 
-def run_server(host: str, port: int, mode: str, error_code: str) -> None:
+def run_server(host: str, port: int, mode: str, error_code: str,
+               strict_confirm: bool = False) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -653,13 +716,16 @@ def run_server(host: str, port: int, mode: str, error_code: str) -> None:
     print(f"  │  {'Listening on':<14}{host}:{port:<{w-16}}│")
     print(f"  │  {'Mode':<14}{mode:<{w-14}}│")
     if mode == "decline":
-        print(f"  │  {'Response code':<14}{'005 (decline)':<{w-14}}│")
+        print(f"  │  {'Response code':<14}{'100 (do not honour)':<{w-14}}│")
     if mode == "error":
         rc    = resolve_code(error_code)
         label = next((v[1] for v in SCENARIOS.values() if v[0] == rc), rc)
         print(f"  │  {'Response code':<14}{rc} — {label:<{w-17}}│")
     if mode == "interactive":
         print(f"  │  {'Prompt':<14}{'[a]pprove or pick decline scenario':<{w-14}}│")
+    if strict_confirm:
+        print(f"  │  {'Confirm':<14}{'strict §4.2 coherence (MT/NCAR)':<{w-14}}│")
+    print(f"  │  {'Terminator':<14}{chr(39)+RESPONSE_END+chr(39)+' (v5.4.4)':<{w-14}}│")
     print(f"  └{'─'*w}┘")
     print()
     print("  Ctrl-C to stop\n")
@@ -672,7 +738,7 @@ def run_server(host: str, port: int, mode: str, error_code: str) -> None:
             conn, addr = srv.accept()
             threading.Thread(
                 target=handle_client,
-                args=(conn, addr, mode, error_code),
+                args=(conn, addr, mode, error_code, strict_confirm),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
@@ -699,13 +765,16 @@ def main() -> None:
     p.add_argument("--code",  default="909",
                    help="RC for --mode error — numeric (e.g. 116) or scenario name "
                         "(e.g. insufficient_funds). Default: 909")
+    p.add_argument("--strict-confirm", action="store_true",
+                   help="Reject the confirmation (TM 002, RC=307) when its echoed "
+                        "MT/NCAR disagree with the approved payment (spec §4.2).")
     p.add_argument("--debug", action="store_true", help="Print all TLV fields")
     args = p.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    run_server(args.host, args.port, args.mode, args.code)
+    run_server(args.host, args.port, args.mode, args.code, args.strict_confirm)
 
 
 if __name__ == "__main__":

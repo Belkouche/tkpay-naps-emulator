@@ -3,6 +3,8 @@
 Python TCP server that emulates a NAPS Pay terminal for local development and testing.
 Speaks the two-phase M2M TLV protocol on **port 4444**.
 
+Tracks **NapsPay v5.4.4** and the **Aslan.Naps SDK v1.0.8** (TLV Protocol Specification v2.0).
+
 No dependencies — stdlib Python 3.10+ only.
 
 ---
@@ -16,7 +18,7 @@ python3 naps_emulator.py
 # Operator prompted to approve or pick a decline scenario per payment
 python3 naps_emulator.py --mode interactive
 
-# Decline all payments (RC=005)
+# Decline all payments (RC=100 do not honour)
 python3 naps_emulator.py --mode decline
 
 # Return a specific error code — numeric or named scenario
@@ -29,6 +31,10 @@ python3 naps_emulator.py --mode timeout
 
 # Phase-2 never responds — tests 40-second confirmation timeout
 python3 naps_emulator.py --mode no_confirm
+
+# Enforce spec §4.2 coherence: reject the confirmation (RC=307) if its
+# echoed MT/NCAR disagree with the approved payment
+python3 naps_emulator.py --strict-confirm
 
 # Different port + verbose TLV field logging
 python3 naps_emulator.py --port 4445 --debug
@@ -50,7 +56,9 @@ Your SDK / Client            Emulator (port 4444)
 
 The emulator keeps the TCP connection open after each response, exactly like the real terminal. Phase-2 can arrive on the same or a new connection.
 
-**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with `?` as the end-of-message terminator. The SDK parses at the first `?` — everything after it is ignored.
+**Wire format:** requests arrive as raw TLV with **no terminator**. Responses are sent with **`!`** as the end-of-message terminator (NapsPay v5.4.4 changed this from `?` → `!`; the SDK reads until `!`). Everything after the `!` is ignored.
+
+**Confirmation coherence (spec §4.2):** SDK v1.0.8 echoes `MT/DE/NCAR/DAEX` from the approved payment into the confirmation (TM 002) so the terminal can reinforce coherence checks. The emulator logs these fields, and with `--strict-confirm` it rejects the confirmation with `RC=307` when the echoed `MT` or `NCAR` disagree with the approved payment.
 
 ---
 
@@ -81,7 +89,7 @@ Each DP line is encoded as:
 *                       ← line separator (* on all but last, ? on last)
 ```
 
-The header line contains `"TKpay"` (bold, centred). The last line separator uses `*`; there is no trailing `?` in the DP content itself.
+The header line contains `"TKpay"` (bold, centred). Lines are joined with `*`; the DP content itself carries no trailing terminator — the `!` end-of-message marker is appended to the whole response, not the DP block.
 
 ---
 
@@ -91,10 +99,12 @@ The header line contains `"TKpay"` (bold, centred). The last line separator uses
 |---|---|---|---|
 | `approve` | RC=000 + full receipt | RC=000 + receipt | Normal happy path |
 | `interactive` | Operator prompted per payment | RC=000 + receipt (if approved) | Manual scenario selection during dev/demo |
-| `decline` | RC=005 + decline receipt | — | Generic card declined |
+| `decline` | RC=100 + decline receipt | — | Generic card declined (do not honour) |
 | `error` | RC=`--code` + decline receipt | — | Specific error scenario |
 | `timeout` | Hangs forever | — | Test Phase-1 client timeout |
 | `no_confirm` | RC=000 | Hangs forever | Test 40-second Phase-2 timeout |
+
+`--strict-confirm` is a flag (composable with the modes above): it makes Phase-2 return `RC=307` when the confirmation's echoed `MT`/`NCAR` do not match the approved payment (spec §4.2 coherence), instead of `RC=000`.
 
 ---
 
@@ -113,11 +123,12 @@ Pass a scenario name to `--code` or select it by number in interactive mode:
 | 7 | `card_not_active` | 118 | Card not yet activated |
 | 8 | `transaction_not_allowed` | 120 | Transaction type blocked at terminal |
 | 9 | `exceeds_limits` | 121 | Daily/weekly limit exceeded |
-| 10 | `use_chip` | 265 | Contactless refused — insert card |
-| 11 | `pin_failed` | 281 | PIN verification failed |
-| 12 | `system_down` | 909 | Terminal/server unreachable |
-| 13 | `issuer_unavailable` | 912 | Card issuer not responding |
-| 14 | `server_error` | 995 | NAPS server processing error |
+| 10 | `invalid_cvv` | 183 | Invalid CVV |
+| 11 | `system_down` | 909 | Terminal/server unreachable |
+| 12 | `issuer_unavailable` | 912 | Card issuer not responding |
+| 13 | `server_error` | 995 | NAPS server processing error |
+
+All codes and labels track the TLV Protocol Specification v2.0 §6 table (mirrored by `LtvProtocol.ResponseCodes` in the SDK). Any `--code` value in that table (e.g. `482` already-cancelled, `280` alternative-amount-cancelled) also works even if not listed above.
 
 Examples:
 
