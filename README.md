@@ -32,6 +32,10 @@ python3 naps_emulator.py --mode timeout
 # Phase-2 never responds — tests 40-second confirmation timeout
 python3 naps_emulator.py --mode no_confirm
 
+# Phase-1 approves, Phase-2 (TM 102) refuses with --code (302 sale not found,
+# 482 already cancelled) — tests SDK v1.5.0 confirmation-refusal handling
+python3 naps_emulator.py --mode confirm_error --code already_cancelled
+
 # Enforce spec §4.2 coherence: reject the confirmation (RC=307) if its
 # echoed MT/NCAR disagree with the approved payment
 python3 naps_emulator.py --strict-confirm
@@ -56,7 +60,14 @@ Your SDK / Client            Emulator (port 4444)
        │                            │
        │  Phase 2 TM=002 ──────────>│  Confirmation (same or new connection)
        │<────────── TM=102 ─────────│  RC=000 + STAN + DP customer receipt
+       │                            │
+       │  Void TM=003 ─────────────>│  Cancellation (MT + STAN of the sale)
+       │<────────── TM=103 ─────────│  RC=000 + card + DATR/HETR + DP merchant void receipt
+       │  Void TM=004 ─────────────>│  Cancellation confirmation (same connection)
+       │<────────── TM=104 ─────────│  RC=000 + card + void STAN + DP customer void receipt
 ```
+
+**Two-phase void (SDK v1.5.0 / NapsPay v5.4.4):** `CancelAsync` sends TM 003 then TM 004 on the same connection. The emulator answers TM 103 (which also keeps the original `STAN`, for SDKs that stop after TM 103, such as Aslan.Naps) and TM 104 with a fresh void STAN. Void receipts are labelled `ANNULATION`.
 
 The emulator keeps the TCP connection open after each response, exactly like the real terminal. Phase-2 can arrive on the same or a new connection.
 
@@ -107,6 +118,7 @@ The header line contains `"TKpay"` (bold, centred). Lines are joined with `*`; t
 | `error` | RC=`--code` + decline receipt | — | Specific error scenario |
 | `timeout` | Hangs forever | — | Test Phase-1 client timeout |
 | `no_confirm` | RC=000 | Hangs forever | Test 40-second Phase-2 timeout |
+| `confirm_error` | RC=000 + full receipt | TM 102 with RC=`--code`, no receipt | Confirmation refused (e.g. 302, 482) |
 
 `--strict-confirm` is a flag (composable with the modes above): it makes Phase-2 return `RC=307` when the confirmation's echoed `MT`/`NCAR` do not match the approved payment (spec §4.2 coherence), instead of `RC=000`.
 

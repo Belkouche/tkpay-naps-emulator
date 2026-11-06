@@ -12,7 +12,8 @@ Usage:
     python3 naps_emulator.py --mode no_confirm        # Phase-2 hangs (tests 40-s confirmation timeout)
     python3 naps_emulator.py --mode error --code 909
     python3 naps_emulator.py --mode error --code insufficient_funds
-    python3 naps_emulator.py --mode interactive       # prompt [a]pprove or pick a decline scenario
+    python3 naps_emulator.py --mode confirm_error --code already_cancelled
+    python3 naps_emulator.py --mode interactive      # prompt [a]pprove or pick a decline scenario
     python3 naps_emulator.py --debug                  # print every TLV field
 
 Supported modes:
@@ -21,6 +22,7 @@ Supported modes:
     timeout      Phase-1 never responds
     no_confirm   Phase-2 never responds
     error        Phase-1 returns the code supplied with --code (name or number)
+    confirm_error Phase-1 approves, Phase-2 (TM 102) refuses with --code (e.g. 302, 482)
     interactive  Prompt operator to approve or choose a decline scenario per payment
 
 Named scenarios for --code:
@@ -38,6 +40,8 @@ Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
     Confirmation (TM 002): the SDK echoes MT/DE/NCAR/DAEX from the payment
                response per spec §4.2 — the emulator verifies these against the
                approved payment and can reject a mismatch (see --strict-confirm).
+    Void:      two-phase on the same connection (SDK v1.5.0): TM 003 → TM 103
+               (merchant receipt), then TM 004 → TM 104 (void STAN, customer receipt).
 """
 
 import argparse
@@ -194,6 +198,7 @@ TM_NAMES = {
     "001": "Payment",
     "002": "Confirmation",
     "003": "Cancellation",
+    "004": "Cancellation confirmation",
     "008": "Duplicate receipt",
     "009": "Network test",
     "010": "Totals",
@@ -246,7 +251,8 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
                   merchant_name: str = "TKPAY DEMO",
                   merchant_city: str = "CASABLANCA",
                   term_id: str = "00000001",
-                  is_customer_copy: bool = False) -> str:
+                  is_customer_copy: bool = False,
+                  txn_label: str = "DEBIT") -> str:
     now         = datetime.now()
     date_str    = now.strftime("%d/%m/%Y %H:%M:%S")
     amount_mad  = f"{amount_centimes / 100:.2f}"
@@ -268,7 +274,7 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
         _receipt_line(20, LINE_SEP,                      "G", "S"),
         _receipt_line(21, f"MONTANT: {amount_mad} MAD",  "G", "S"),
         _receipt_line(22, LINE_SEP,                      "G", "S"),
-        _receipt_line(23, "DEBIT",                       "G", "S"),
+        _receipt_line(23, txn_label,                     "G", "S"),
         _receipt_line(24, copy_label,                    "G", "S"),
     ]
     return _join_lines(lines)
@@ -375,21 +381,52 @@ def phase2_coherence_reject(req: dict, reason: str) -> str:
     return _common_fields(req, "102", "307") + f("008", req.get("008", "000000"))
 
 
+def phase2_refusal(req: dict, rc: str) -> str:
+    """
+    TM=102 with CR≠000 — the terminal refuses the confirmation (e.g. 302 sale
+    not found, 482 already cancelled; the terminal auto-reverses). SDK v1.5.0
+    reports this as a failed payment.
+    """
+    return _common_fields(req, "102", rc) + f("008", req.get("008", "000000"))
+
+
 def cancellation_response(req: dict) -> str:
     """
-    TM=003 → TM=103  RC=000 (void accepted).
-    v5.4.4: the SDK sends MT (002) in the cancel frame; echo it back along with
-    the original transaction date/time (DATR/HETR) the SDK maps to
-    OriginalTransactionDate/Time. The SDK accepts MT 103 or 104 with RC=000.
+    TM=003 → TM=103  RC=000 (void performed) — phase 1 of a two-phase void.
+    v5.4.4: the SDK sends MT (002) in the cancel frame (echoed by _common_fields).
+    Like NapsPay, the reply carries card details, the original transaction
+    date/time (DATR/HETR) and the merchant void receipt; STAN is kept so SDKs
+    that stop at TM 103 still get one. The SDK then sends TM 004.
     """
-    now  = datetime.now()
-    stan = req.get("008", generate_stan())
-    resp = _common_fields(req, "103", "000") + f("008", stan)
-    # Echo the original amount if supplied, plus original-transaction timestamps.
-    if req.get("002"):
-        resp += f("002", req["002"])
-    resp += f("018", now.strftime("%d%m%Y")) + f("019", now.strftime("%H%M%S"))
-    return resp
+    now    = datetime.now()
+    stan   = req.get("008", generate_stan())
+    amount = int(req.get("002", "0") or "0")
+    dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
+                           is_customer_copy=False, txn_label="ANNULATION")
+    return (
+        _common_fields(req, "103", "000") +
+        _card_details(MASKED_CARD) +
+        f("008", stan) +
+        f("018", now.strftime("%d%m%Y")) + f("019", now.strftime("%H%M%S")) +
+        f("010", dp)
+    )
+
+
+def cancellation_confirmation_response(req: dict) -> str:
+    """
+    TM=004 → TM=104  RC=000 — phase 2 of a void (SDK v1.5.0+), sent on the same
+    connection after TM 103. Returns the void STAN and the customer void receipt.
+    """
+    stan   = generate_stan()
+    amount = int(req.get("002", "0") or "0")
+    dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
+                           is_customer_copy=True, txn_label="ANNULATION")
+    return (
+        _common_fields(req, "104", "000") +
+        _card_details(MASKED_CARD) +
+        f("008", stan) +
+        f("010", dp)
+    )
 
 
 def network_test_response(req: dict) -> str:
@@ -637,7 +674,12 @@ def handle_client(conn: socket.socket, addr: tuple,
                               f"DE={fields.get('012')} NCAR={fields.get('007')} DAEX={fields.get('017')}")
 
                 mismatch = confirmation_coherence_error(fields, current_amount) if strict_confirm else None
-                if mismatch:
+                if mode == "confirm_error":
+                    rc   = resolve_code(error_code)
+                    resp = phase2_refusal(fields, rc)
+                    log.info(f"[{peer}] Phase-2 → RC={rc} (confirmation refused)")
+                    send(conn, resp, CHARSET, terminator)
+                elif mismatch:
                     resp = phase2_coherence_reject(fields, mismatch)
                     log.info(f"[{peer}] Phase-2 → RC=307 (coherence reject: {mismatch})")
                     send(conn, resp, CHARSET, terminator)
@@ -656,6 +698,12 @@ def handle_client(conn: socket.socket, addr: tuple,
                 log.info(f"[{peer}] Cancellation → RC=000  STAN={stan}")
                 send(conn, resp, CHARSET, terminator)
                 current_stan = None
+
+            # ── TM=004  Cancellation confirmation ────────────────────────────
+            elif tm == "004":
+                resp = cancellation_confirmation_response(fields)
+                log.info(f"[{peer}] Cancellation confirmation → RC=000  STAN={parse(resp).get('008')}")
+                send(conn, resp, CHARSET, terminator)
 
             # ── TM=008  Duplicate receipt ─────────────────────────────────────
             elif tm == "008":
@@ -725,7 +773,7 @@ def run_server(host: str, port: int, mode: str, error_code: str,
     print(f"  │  {'Mode':<14}{mode:<{w-14}}│")
     if mode == "decline":
         print(f"  │  {'Response code':<14}{'100 (do not honour)':<{w-14}}│")
-    if mode == "error":
+    if mode in ("error", "confirm_error"):
         rc    = resolve_code(error_code)
         label = next((v[1] for v in SCENARIOS.values() if v[0] == rc), rc)
         print(f"  │  {'Response code':<14}{rc} — {label:<{w-17}}│")
@@ -768,11 +816,11 @@ def main() -> None:
     p.add_argument("--port",  default=PORT, type=int, help=f"TCP port (default: {PORT})")
     p.add_argument(
         "--mode", default="approve",
-        choices=["approve", "decline", "interactive", "timeout", "no_confirm", "error"],
+        choices=["approve", "decline", "interactive", "timeout", "no_confirm", "error", "confirm_error"],
         help="Response mode (default: approve). interactive = prompt [a]pprove/[d]ecline per payment",
     )
     p.add_argument("--code",  default="909",
-                   help="RC for --mode error — numeric (e.g. 116) or scenario name "
+                   help="RC for --mode error / confirm_error — numeric (e.g. 116) or scenario name "
                         "(e.g. insufficient_funds). Default: 909")
     p.add_argument("--strict-confirm", action="store_true",
                    help="Reject the confirmation (TM 002, RC=307) when its echoed "
