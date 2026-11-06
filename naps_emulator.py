@@ -23,6 +23,10 @@ Supported modes:
     no_confirm   Phase-2 never responds
     error        Phase-1 returns the code supplied with --code (name or number)
     confirm_error Phase-1 approves, Phase-2 (TM 102) refuses with --code (e.g. 302, 482)
+    void_refuse  TM 103 refuses the void with --code (e.g. 302 not found, 482 already cancelled)
+    void_480     TM 104 returns CR=480 (reversal accepted — a success, no receipt)
+    void_995     TM 104 returns CR=995 (server processing error)
+    void_no_confirm  TM 004 gets no reply
     interactive  Prompt operator to approve or choose a decline scenario per payment
 
 Named scenarios for --code:
@@ -42,6 +46,9 @@ Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
                approved payment and can reject a mismatch (see --strict-confirm).
     Void:      two-phase on the same connection (SDK v1.5.0): TM 003 → TM 103
                (merchant receipt), then TM 004 → TM 104 (void STAN, customer receipt).
+               TM 103/104 replies carry NO terminator (live v5.4.4 behaviour).
+               TM 004 needs NS (004) = the TM 003 sequence (NS, or NSA) → else CR=307,
+               and MT (002) → else CR=909.
 """
 
 import argparse
@@ -115,6 +122,10 @@ DECLINE_MENU: list[str] = [
     "issuer_unavailable",
     "server_error",
 ]
+
+
+# TM 104 response code per void-confirmation mode (480 = reversal accepted, a success per §4.4).
+VOID_CONFIRM_CODES: dict[str, str] = {"void_480": "480", "void_995": "995"}
 
 
 def resolve_code(code: str) -> str:
@@ -390,16 +401,22 @@ def phase2_refusal(req: dict, rc: str) -> str:
     return _common_fields(req, "102", rc) + f("008", req.get("008", "000000"))
 
 
-def cancellation_response(req: dict) -> str:
+def cancellation_response(req: dict, rc: str = "000") -> str:
     """
     TM=003 → TM=103  RC=000 (void performed) — phase 1 of a two-phase void.
     v5.4.4: the SDK sends MT (002) in the cancel frame (echoed by _common_fields).
     Like NapsPay, the reply carries card details, the original transaction
     date/time (DATR/HETR) and the merchant void receipt; STAN is kept so SDKs
     that stop at TM 103 still get one. The SDK then sends TM 004.
+    RC≠000 (spec §4.3: not found / other error, e.g. 302, 482) carries no card
+    details or receipt.
     """
     now    = datetime.now()
     stan   = req.get("008", generate_stan())
+    if not req.get("004") and req.get("005"):
+        req = {**req, "004": req["005"]}   # NSA-only TM 003: echo it as NS, the value TM 004 must send
+    if rc != "000":
+        return _common_fields(req, "103", rc) + f("008", stan)
     amount = int(req.get("002", "0") or "0")
     dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
                            is_customer_copy=False, txn_label="ANNULATION")
@@ -412,21 +429,44 @@ def cancellation_response(req: dict) -> str:
     )
 
 
-def cancellation_confirmation_response(req: dict) -> str:
+def cancellation_confirmation_response(req: dict, rc: str = "000") -> str:
     """
-    TM=004 → TM=104  RC=000 — phase 2 of a void (SDK v1.5.0+), sent on the same
-    connection after TM 103. Returns the void STAN and the customer void receipt.
+    TM=004 → TM=104 — phase 2 of a void (SDK v1.5.0+), sent on the same
+    connection after TM 103. Returns the void STAN, echoes DATR/HETR (spec §4.4)
+    and, only when CR=000, the customer void receipt. CR=480 also means the
+    cancellation completed (spec §4.4).
     """
     stan   = generate_stan()
     amount = int(req.get("002", "0") or "0")
-    dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
+    resp   = _common_fields(req, "104", rc) + _card_details(MASKED_CARD) + f("008", stan)
+    for tag in ("018", "019"):
+        if req.get(tag):
+            resp += f(tag, req[tag])
+    if rc == "000":
+        dp = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
                            is_customer_copy=True, txn_label="ANNULATION")
-    return (
-        _common_fields(req, "104", "000") +
-        _card_details(MASKED_CARD) +
-        f("008", stan) +
-        f("010", dp)
-    )
+        resp += f("010", dp)
+    return resp
+
+
+def cancellation_confirmation_reject(req: dict, rc: str) -> str:
+    """TM=104 with CR≠000 and no card details or receipt (missing MT, NS mismatch)."""
+    return _common_fields(req, "104", rc) + f("008", req.get("008", "000000"))
+
+
+def cancellation_confirmation_error(req: dict, void_ns: str | None) -> tuple[str, str] | None:
+    """
+    Validate a TM 004 against the preceding TM 003 on this connection.
+    Returns (rc, reason) to reject, or None when valid.
+      - no MT (002)          → 909, as the live v5.4.4 terminal does
+      - NS (004) missing or ≠ the TM 003 sequence (spec §3: 004.NS = 003.NS) → 307
+    """
+    if not req.get("002"):
+        return "909", "TM 004 without MT (002)"
+    ns = req.get("004")
+    if void_ns is None or ns != void_ns:
+        return "307", f"NS mismatch: TM 004 NS={ns} vs TM 003 sequence={void_ns}"
+    return None
 
 
 def network_test_response(req: dict) -> str:
@@ -625,6 +665,7 @@ def handle_client(conn: socket.socket, addr: tuple,
 
     current_stan:   str | None = None
     current_amount: int       = 0
+    void_ns:        str | None = None
 
     try:
         while True:
@@ -692,18 +733,34 @@ def handle_client(conn: socket.socket, addr: tuple,
                 current_amount = 0
 
             # ── TM=003  Cancellation/void ─────────────────────────────────────
+            # TM 103/104 carry no terminator, like the live v5.4.4 terminal —
+            # SDKs must fall back to inter-chunk silence framing.
             elif tm == "003":
                 stan = fields.get("008", "?")
-                resp = cancellation_response(fields)
-                log.info(f"[{peer}] Cancellation → RC=000  STAN={stan}")
-                send(conn, resp, CHARSET, terminator)
+                rc   = resolve_code(error_code) if mode == "void_refuse" else "000"
+                resp = cancellation_response(fields, rc)
+                log.info(f"[{peer}] Cancellation → RC={rc}  STAN={stan}")
+                send(conn, resp, CHARSET, "")
                 current_stan = None
+                # Sequence the TM 004 must echo in NS; NSA (005) is accepted for TM 003.
+                void_ns = (fields.get("004") or fields.get("005")) if rc == "000" else None
 
             # ── TM=004  Cancellation confirmation ────────────────────────────
             elif tm == "004":
-                resp = cancellation_confirmation_response(fields)
-                log.info(f"[{peer}] Cancellation confirmation → RC=000  STAN={parse(resp).get('008')}")
-                send(conn, resp, CHARSET, terminator)
+                reject = cancellation_confirmation_error(fields, void_ns)
+                void_ns = None
+                if reject:
+                    rc, reason = reject
+                    resp = cancellation_confirmation_reject(fields, rc)
+                    log.info(f"[{peer}] Cancellation confirmation → RC={rc} ({reason})")
+                    send(conn, resp, CHARSET, "")
+                elif mode == "void_no_confirm":
+                    log.info(f"[{peer}] MODE=void_no_confirm — no reply to TM 004")
+                else:
+                    rc   = VOID_CONFIRM_CODES.get(mode, "000")
+                    resp = cancellation_confirmation_response(fields, rc)
+                    log.info(f"[{peer}] Cancellation confirmation → RC={rc}  STAN={parse(resp).get('008')}")
+                    send(conn, resp, CHARSET, "")
 
             # ── TM=008  Duplicate receipt ─────────────────────────────────────
             elif tm == "008":
@@ -773,7 +830,7 @@ def run_server(host: str, port: int, mode: str, error_code: str,
     print(f"  │  {'Mode':<14}{mode:<{w-14}}│")
     if mode == "decline":
         print(f"  │  {'Response code':<14}{'100 (do not honour)':<{w-14}}│")
-    if mode in ("error", "confirm_error"):
+    if mode in ("error", "confirm_error", "void_refuse"):
         rc    = resolve_code(error_code)
         label = next((v[1] for v in SCENARIOS.values() if v[0] == rc), rc)
         print(f"  │  {'Response code':<14}{rc} — {label:<{w-17}}│")
@@ -816,11 +873,12 @@ def main() -> None:
     p.add_argument("--port",  default=PORT, type=int, help=f"TCP port (default: {PORT})")
     p.add_argument(
         "--mode", default="approve",
-        choices=["approve", "decline", "interactive", "timeout", "no_confirm", "error", "confirm_error"],
+        choices=["approve", "decline", "interactive", "timeout", "no_confirm", "error", "confirm_error",
+                 "void_refuse", "void_480", "void_995", "void_no_confirm"],
         help="Response mode (default: approve). interactive = prompt [a]pprove/[d]ecline per payment",
     )
     p.add_argument("--code",  default="909",
-                   help="RC for --mode error / confirm_error — numeric (e.g. 116) or scenario name "
+                   help="RC for --mode error / confirm_error / void_refuse — numeric (e.g. 116) or scenario name "
                         "(e.g. insufficient_funds). Default: 909")
     p.add_argument("--strict-confirm", action="store_true",
                    help="Reject the confirmation (TM 002, RC=307) when its echoed "

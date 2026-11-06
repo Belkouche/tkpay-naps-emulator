@@ -36,6 +36,12 @@ python3 naps_emulator.py --mode no_confirm
 # 482 already cancelled) — tests SDK v1.5.0 confirmation-refusal handling
 python3 naps_emulator.py --mode confirm_error --code already_cancelled
 
+# Void (cancellation) failure modes — payments are approved normally
+python3 naps_emulator.py --mode void_refuse --code record_not_found   # TM 103 CR=302 (or 482, ...)
+python3 naps_emulator.py --mode void_480          # TM 104 CR=480 (reversal accepted = success)
+python3 naps_emulator.py --mode void_995          # TM 104 CR=995 (outcome unknown)
+python3 naps_emulator.py --mode void_no_confirm   # TM 004 gets no reply
+
 # Enforce spec §4.2 coherence: reject the confirmation (RC=307) if its
 # echoed MT/NCAR disagree with the approved payment
 python3 naps_emulator.py --strict-confirm
@@ -67,7 +73,11 @@ Your SDK / Client            Emulator (port 4444)
        │<────────── TM=104 ─────────│  RC=000 + card + void STAN + DP customer void receipt
 ```
 
-**Two-phase void (SDK v1.5.0 / NapsPay v5.4.4):** `CancelAsync` sends TM 003 then TM 004 on the same connection. The emulator answers TM 103 (which also keeps the original `STAN`, for SDKs that stop after TM 103, such as Aslan.Naps) and TM 104 with a fresh void STAN. Void receipts are labelled `ANNULATION`.
+**Two-phase void (spec §4.3/§4.4, NapsPay v5.4.4):** `CancelAsync` sends TM 003 then TM 004 on the same connection. The emulator answers TM 103 (which also keeps the original `STAN`, for SDKs that stop after TM 103, such as Aslan.Naps) and TM 104 with a fresh void STAN. Void receipts are labelled `ANNULATION`; TM 104 carries a receipt only when CR=000.
+
+- **No terminator on TM 103/104.** Like the live v5.4.4 terminal, these two replies end with no `!`/`?`, so SDKs must frame them by inter-chunk silence. All other replies keep the `--protocol` terminator.
+- **TM 004 must carry NS (004) equal to the TM 003 sequence** (spec: 004.NS = 003.NS). The TM 003 sequence is its NS, or its NSA (005) when NS is absent; TM 103 echoes it as NS. A missing or mismatched NS, or a TM 004 without a successful TM 003 before it on the connection, gets TM 104 `CR=307`.
+- **TM 004 without the amount (002) gets TM 104 `CR=909`**, as the live terminal does.
 
 The emulator keeps the TCP connection open after each response, exactly like the real terminal. Phase-2 can arrive on the same or a new connection.
 
@@ -119,6 +129,10 @@ The header line contains `"TKpay"` (bold, centred). Lines are joined with `*`; t
 | `timeout` | Hangs forever | — | Test Phase-1 client timeout |
 | `no_confirm` | RC=000 | Hangs forever | Test 40-second Phase-2 timeout |
 | `confirm_error` | RC=000 + full receipt | TM 102 with RC=`--code`, no receipt | Confirmation refused (e.g. 302, 482) |
+| `void_refuse` | approve | approve | Void: TM 103 refused with RC=`--code` (302 not found, 482 already cancelled) |
+| `void_480` | approve | approve | Void: TM 104 CR=480, no receipt (completed) |
+| `void_995` | approve | approve | Void: TM 104 CR=995, no receipt (outcome unknown) |
+| `void_no_confirm` | approve | approve | Void: TM 004 never answered |
 
 `--strict-confirm` is a flag (composable with the modes above): it makes Phase-2 return `RC=307` when the confirmation's echoed `MT`/`NCAR` do not match the approved payment (spec §4.2 coherence), instead of `RC=000`.
 
