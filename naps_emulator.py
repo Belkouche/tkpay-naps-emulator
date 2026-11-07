@@ -340,6 +340,7 @@ def phase1_response(req: dict, mode: str, error_code: str,
 
     stan    = generate_stan()
     auth    = generate_approval()
+    _AUTH_BY_STAN[stan] = auth           # TM 102 prints the same authorisation number
     ncai    = req.get("003", "0100001")
     amount  = int(req.get("002", "0") or "0")
     dp      = build_receipt(amount, stan, MASKED_CARD, auth, ncai, is_customer_copy=False)
@@ -375,7 +376,7 @@ def confirmation_coherence_error(req: dict, phase1_amount: int) -> str | None:
 def phase2_response(req: dict, phase1_stan: str, phase1_amount: int) -> str:
     stan   = phase1_stan
     ncai   = req.get("003", "0100001")
-    auth   = generate_approval()
+    auth   = _AUTH_BY_STAN.pop(stan, None) or generate_approval()
     dp     = build_receipt(phase1_amount, stan, MASKED_CARD, auth, ncai, is_customer_copy=True)
 
     return (
@@ -542,6 +543,7 @@ def reset_response(req: dict) -> str:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 MASKED_CARD = "516794******3315"
+_AUTH_BY_STAN: dict = {}   # STAN -> authorisation number of the approved TM 101
 
 def generate_stan()     -> str: return f"{random.randint(1, 999999):06d}"
 def generate_approval() -> str: return f"{random.randint(100000, 999999)}"
