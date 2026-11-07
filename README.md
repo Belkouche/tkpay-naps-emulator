@@ -46,7 +46,8 @@ def tlv(tag, value): return f"{tag}{len(value):03d}{value}"          # TAG(3) + 
 ...
 with socket.create_connection(("127.0.0.1", port)) as s:              # one connection for both phases
     r1 = exchange(s, tlv("001", "001") + tlv("002", "15000") + tlv("003", "0100001") + tlv("004", "000001") + tlv("012", "504"))
-    print(f"TM {r1['001']}  CR={r1['013']}  STAN={r1['008']}  card={r1['007']}")
+    print(f"TM {r1['001']}  CR={r1['013']}  STAN={r1.get('008', '-')}  card={r1.get('007', '-')}")
+    if r1["013"] != "000": sys.exit("declined: no confirmation is sent")  # only an approved TM 101 is confirmed
     r2 = exchange(s, tlv("001", "002") + tlv("003", "0100001") + tlv("004", "000001") + tlv("008", r1["008"]))
     print(f"TM {r2['001']}  CR={r2['013']}  STAN={r2['008']}  {'approved' if r2['013'] == '000' else 'refused'}")
 ```
