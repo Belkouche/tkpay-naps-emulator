@@ -350,8 +350,8 @@ NAPS_EMULATOR_MODE=void_480 NAPS_EMULATOR_PORT=4451 dotnet test --filter Categor
 |------|-----------|-------------|
 | `tkpay-sdk-pos-naps-csharp` | `tests/TKPay.Naps.Tests/EmulatorVoidIntegrationTests.cs` | Start the emulator yourself, set `NAPS_EMULATOR_MODE` / `NAPS_EMULATOR_PORT`; its `void_refuse` test expects `--code 302` |
 | `aslan-naps-sdk` | `tests/run-emulator-void-tests.sh` | Script starts one emulator per void mode and runs the tests |
-| `tkpay-sdk-pos-naps-node` | `test/client.integration.test.ts` | Spawns the emulator from `NAPS_EMULATOR` (port `NAPS_EMULATOR_PORT`, default 4471) |
-| `tkpay-sdk-pos-naps-flutter` | `test/emulator_e2e_test.dart` | Spawns the emulator from `NAPS_EMULATOR` |
+| `tkpay-sdk-pos-naps-node` | `test/client.integration.test.ts` | Spawns the emulator from `NAPS_EMULATOR` (default `../tkpay-naps-emulator/naps_emulator.py`; port `NAPS_EMULATOR_PORT`, default 4471) |
+| `tkpay-sdk-pos-naps-flutter` | `test/emulator_e2e_test.dart` | Spawns the emulator from `NAPS_EMULATOR` (default `../tkpay-naps-emulator/naps_emulator.py`) |
 | `tkpay-sdk-pos-naps-android` | `naps-sdk/src/test/.../EmulatorIntegrationTest.kt` | `NAPS_EMULATOR_PORT=… NAPS_EMULATOR_MODE=… ./gradlew :naps-sdk:testDebugUnitTest` |
 | `tkpay-sdk-pos-naps-ios` | `Tests/TKPayNapsTests/EmulatorIntegrationTests.swift` | `NAPS_EMULATOR_PORT=… swift test --filter EmulatorIntegrationTests` |
 | `tkpay-sdk-pos-naps-rn` | `test-integration.test.js` | `NAPS_PORT=… NAPS_EMULATOR_MODE=… npm run test:integration` |
