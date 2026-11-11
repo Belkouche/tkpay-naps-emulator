@@ -168,29 +168,35 @@ A void (cancellation) is also **two round trips on one connection**:
 ```
  ECR / SDK                                   Emulator
     │  TM 003  cancellation request          │
-    │  STAN of the sale, MT, NS (or NSA) ──▶ │
+    │  STAN of the sale, MT, NS (+ NSA) ───▶ │
     │                                        │
     │ ◀────────────── TM 103  CR=000         │   "transaction found": NCAR, DAEX,
-    │                 (NO terminator)        │   DATR/HETR, merchant receipt
+    │                 (NO terminator)        │   DATR/HETR, no receipt
     │                                        │
     │  TM 004  cancellation confirmation     │
     │  NS = TM 003 sequence, MT required ──▶ │
     │                                        │
     │ ◀────────────── TM 104  CR=000         │   reversal executed: void STAN,
-    │                 (NO terminator)        │   customer receipt
+    │                 (NO terminator)        │   void receipt = merchant copy
 ```
 
 Rules the emulator enforces, matching the spec and the live v5.4.4 terminal:
 
 1. **No terminator on TM 103 and TM 104.** Your client must end these reads on
    silence (~1 s), not on `!`/`?`. Every other reply keeps its terminator.
-2. **NS rule.** TM 004 must carry **NS (tag 004)** equal to the TM 003 sequence.
-   The TM 003 sequence is its NS, or its NSA (tag 005) when NS is absent; TM 103
-   echoes it back as NS. A missing or different NS, or a TM 004 with no successful
-   TM 003 before it on the connection, gets **TM 104 CR=`307`**.
+2. **NS rule.** TM 003 must carry **NS (tag 004)**, a new sequence for the void
+   (spec §4.3); without it the reply is **TM 103 CR=`307`**, as the Ingenico
+   Lane3600 answers. NSA (tag 005) may carry the payment's sequence. TM 004 must
+   carry the same NS; a missing or different NS, or a TM 004 with no successful
+   TM 003 before it on the connection, gets **TM 104 CR=`307`**. (`--profile
+   legacy` also accepts an NSA-only TM 003.)
 3. **Amount required.** TM 004 without MT (tag 002) gets **TM 104 CR=`909`**, as the
    live terminal does.
-4. **Reading TM 104.** CR=`000` and CR=`480` both mean the void completed (only
+4. **Receipts.** As on the live Sunmi P2 and Lane3600, TM 103 carries **no
+   receipt**; the TM 104 receipt is the only void receipt and is the **merchant
+   copy** ("Copie Commerçant"). (`--profile legacy`: merchant copy on TM 103,
+   customer copy on TM 104.)
+5. **Reading TM 104.** CR=`000` and CR=`480` both mean the void completed (only
    `000` carries a receipt). CR=`995`, or no TM 104 at all, means the outcome is
    unknown: check with a duplicate-receipt request (TM 008). TM 103 CR=`000` only
    means "transaction found"; nothing is reversed until TM 104.
@@ -204,7 +210,7 @@ Each is one request and one reply (with terminator):
 | Request | Reply | Purpose | Emulator reply |
 |---------|-------|---------|----------------|
 | TM 008 | TM 108 | Duplicate receipt | CR=000 + a receipt for the last STAN on the connection (amount 0) |
-| TM 009 | TM 109 | Network test | CR=000 |
+| TM 009 | TM 101 | Network test | **TM 101 CR=`902`** (no terminator), as the live Sunmi P2's NapsPay app answers: it does not implement TM 009. `--profile legacy`: TM 109 CR=000 |
 | TM 010 | TM 110 | Totals / settlement | CR=000 + a totals receipt (zeros) |
 | TM 012 | TM 112 | Reset PIN pad | CR=000 |
 | TM 013 | TM 113 | Referencing (parameter load) | CR=000, echoes TIDE (020), parameter receipt |
@@ -247,6 +253,7 @@ succeed normally in the payment modes.
 | `--code CODE` | `909` | Response code for `error`, `confirm_error` and `void_refuse`: a number (`116`) or a scenario name (`insufficient_funds`) |
 | `--strict-confirm` | off | Refuse TM 002 with CR=`307` when its echoed MT/NCAR differ from the approved payment |
 | `--protocol v1\|v2` | `v2` | Reply terminator: `!` (v2) or `?` (v1), see [§8](#8-protocol-versions-and-terminators) |
+| `--profile sunmi\|legacy` | `sunmi` | Terminal behaviour, see [§12](#12-known-differences-from-a-real-terminal). `legacy` restores the pre-11/2026 replies for older SDK versions |
 | `--debug` | off | Log every TLV field received |
 
 Examples:
@@ -366,9 +373,20 @@ Use a different port per test run if several suites run at once.
 The emulator follows the protocol, not a bank. Things that differ on purpose or by
 simplification:
 
-- **TM 103 carries a STAN and a merchant receipt.** Spec §4.3 lists neither; the
-  emulator sends both (NapsPay firmware sends a receipt, and some SDKs read the STAN
-  from TM 103). Do not rely on them.
+- **Profile `sunmi` (default) follows the live Sunmi P2 seen on 11/11/2026:** TM 103
+  without a receipt, the TM 104 receipt as the merchant copy with the void's own
+  STAN, TM 009 answered TM 101 / CR 902, no reply to a request ending with `!` or `?`
+  (the real app stalled, and should never receive one), TM 003 without NS refused
+  with CR 307, and receipt text with its accents (`Commerçant`) with lengths counted
+  in characters. `--profile legacy` keeps the earlier behaviour.
+- **Not modelled from the Ingenico Lane3600 (USB only):** the ~30 s delay on the
+  first reply after the port opens, requests lost within ~3 s of a reply, lengths
+  counted in UTF-8 bytes, a DP length capped at 999 for long receipts, TM 104 STAN
+  echoing the sale, and duplicates by STAN answered CR 381. The emulator is TCP only.
+- **TM 103 carries a STAN.** Spec §4.3 does not list it; some SDKs read it.
+- **TM 008/010/012/013 are answered.** The decompiled NapsPay 4.1.1 and 5.3.0
+  Android apps answer every message other than TM 001/003 with TM 101 / CR 902;
+  only TM 009 was checked live, so the others are still answered here.
 - **Declines carry a STAN and a decline receipt.** A real terminal sends no STAN
   and no receipt with a refused TM 101.
 - **No transaction store.** Any STAN can be voided and confirmed; amounts and card

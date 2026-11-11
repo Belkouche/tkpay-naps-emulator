@@ -15,6 +15,7 @@ Usage:
     python3 naps_emulator.py --mode confirm_error --code already_cancelled
     python3 naps_emulator.py --mode interactive      # prompt [a]pprove or pick a decline scenario
     python3 naps_emulator.py --debug                  # print every TLV field
+    python3 naps_emulator.py --profile legacy         # pre-11/2026 behaviour, for older SDK versions
 
 Supported modes:
     approve      All payments approved (default)
@@ -35,6 +36,19 @@ Named scenarios for --code:
     exceeds_limits, cancelled, already_cancelled, use_chip, pin_failed,
     system_down, issuer_unavailable, server_error, record_not_found
 
+Profiles (--profile):
+    sunmi (default)  Behaves like the live Sunmi P2 (NapsPay v5.4.4) seen on 11/11/2026:
+                     - TM 103 carries no receipt; TM 104 carries the only void receipt,
+                       the merchant copy ("Copie Commerçant"), and the void's own STAN
+                     - TM 009 is not implemented: answered TM 101 / CR 902
+                     - a request ending with '!' or '?' gets no reply (the real app stalled)
+                     - TM 003 without NS (004) is refused with CR 307 (spec §4.3; the
+                       Ingenico Lane3600 answers the same)
+                     - receipt text keeps its accents; lengths count characters
+    legacy           The emulator's earlier behaviour: TM 103 merchant receipt, TM 104
+                     customer receipt, TM 009 answered 109, NSA accepted as the TM 003
+                     sequence, accents stripped, terminated requests answered.
+
 Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
     Requests:  raw TLV, no terminator character
     Responses: raw TLV + end-of-message terminator, selected by --protocol:
@@ -44,11 +58,11 @@ Protocol notes (NapsPay v5.4.4 / Aslan.Naps SDK v1.0.8):
     Confirmation (TM 002): the SDK echoes MT/DE/NCAR/DAEX from the payment
                response per spec §4.2 — the emulator verifies these against the
                approved payment and can reject a mismatch (see --strict-confirm).
-    Void:      two-phase on the same connection (SDK v1.5.0): TM 003 → TM 103
-               (merchant receipt), then TM 004 → TM 104 (void STAN, customer receipt).
-               TM 103/104 replies carry NO terminator (live v5.4.4 behaviour).
-               TM 004 needs NS (004) = the TM 003 sequence (NS, or NSA) → else CR=307,
-               and MT (002) → else CR=909.
+    Void:      two-phase on the same connection: TM 003 → TM 103 (no receipt; legacy:
+               merchant receipt), then TM 004 → TM 104 (void STAN; void receipt = merchant
+               copy, legacy: customer copy). TM 103/104 replies carry NO terminator.
+               TM 003 needs NS (004) → else CR=307 (legacy: NSA accepted). TM 004 needs
+               NS = the TM 003 NS → else CR=307, and MT (002) → else CR=909.
 """
 
 import argparse
@@ -80,6 +94,9 @@ RESPONSE_END = "!"   # NapsPay v5.4.4 terminates TCP responses with '!' (was '?'
 # Response terminator per NAPS protocol generation. v1 (pre-v5.4.4) used '?';
 # v2 (v5.4.4+, matches Aslan.Naps SDK v1.0.8) uses '!'. Requests never carry one.
 PROTOCOL_TERMINATORS = {"v1": "?", "v2": "!"}
+
+# Terminal behaviour profile, set from --profile: "sunmi" (live Sunmi P2, default) or "legacy".
+PROFILE = "sunmi"
 
 # ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
 
@@ -137,7 +154,12 @@ def resolve_code(code: str) -> str:
 # ── TLV helpers ───────────────────────────────────────────────────────────────
 
 def _ascii(value: str) -> str:
-    """Replace non-ASCII chars with ASCII equivalents to keep TLV byte-length == char-length."""
+    """
+    Legacy profile: replace non-ASCII chars to keep TLV byte-length == char-length.
+    The Sunmi P2 sends accented text ("Commerçant", "N°") with lengths counted in characters.
+    """
+    if PROFILE != "legacy":
+        return value
     return (value
             .replace("ç", "c").replace("Ç", "C")
             .replace("è", "e").replace("é", "e").replace("ê", "e").replace("ë", "e")
@@ -267,7 +289,7 @@ def build_receipt(amount_centimes: int, stan: str, masked_card: str,
     now         = datetime.now()
     date_str    = now.strftime("%d/%m/%Y %H:%M:%S")
     amount_mad  = f"{amount_centimes / 100:.2f}"
-    copy_label  = "Copie Client" if is_customer_copy else "Copie Commercant"
+    copy_label  = "Copie Client" if is_customer_copy else "Copie Commerçant"
 
     lines = [
         _receipt_line(0,  "TKpay",                       "C", "G"),
@@ -414,20 +436,22 @@ def cancellation_response(req: dict, rc: str = "000") -> str:
     """
     now    = datetime.now()
     stan   = req.get("008", generate_stan())
-    if not req.get("004") and req.get("005"):
+    if PROFILE == "legacy" and not req.get("004") and req.get("005"):
         req = {**req, "004": req["005"]}   # NSA-only TM 003: echo it as NS, the value TM 004 must send
     if rc != "000":
         return _common_fields(req, "103", rc) + f("008", stan)
-    amount = int(req.get("002", "0") or "0")
-    dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
-                           is_customer_copy=False, txn_label="ANNULATION")
-    return (
+    resp = (
         _common_fields(req, "103", "000") +
         _card_details(MASKED_CARD) +
         f("008", stan) +
-        f("018", now.strftime("%d%m%Y")) + f("019", now.strftime("%H%M%S")) +
-        f("010", dp)
+        f("018", now.strftime("%d%m%Y")) + f("019", now.strftime("%H%M%S"))
     )
+    if PROFILE != "legacy":
+        return resp   # live terminals send no receipt with TM 103
+    amount = int(req.get("002", "0") or "0")
+    dp     = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
+                           is_customer_copy=False, txn_label="ANNULATION")
+    return resp + f("010", dp)
 
 
 def cancellation_confirmation_response(req: dict, rc: str = "000") -> str:
@@ -444,8 +468,9 @@ def cancellation_confirmation_response(req: dict, rc: str = "000") -> str:
         if req.get(tag):
             resp += f(tag, req[tag])
     if rc == "000":
+        # Live terminals: the TM 104 receipt is the only void receipt, the merchant copy.
         dp = build_receipt(amount, stan, MASKED_CARD, generate_approval(), req.get("003", "0100001"),
-                           is_customer_copy=True, txn_label="ANNULATION")
+                           is_customer_copy=(PROFILE == "legacy"), txn_label="ANNULATION")
         resp += f("010", dp)
     return resp
 
@@ -471,7 +496,15 @@ def cancellation_confirmation_error(req: dict, void_ns: str | None) -> tuple[str
 
 
 def network_test_response(req: dict) -> str:
-    """TM=009 → TM=109  RC=000."""
+    """
+    TM=009 → TM=109 RC=000 (legacy profile). The Sunmi P2's NapsPay app does not implement
+    TM 009: it answers TM 101 with CR 902 "Invalid transaction", echoing NCAI and NS.
+    """
+    if PROFILE != "legacy":
+        # Field for field as the live Sunmi P2 answered: TM, NCAI, NS, CR, DA, HE.
+        now = datetime.now()
+        return (f("001", "101") + f("003", req.get("003", "0100001")) + f("004", req.get("004", "000001")) +
+                f("013", "902") + f("014", now.strftime("%d%m%Y")) + f("015", now.strftime("%H%M%S")))
     return _common_fields(req, "109", "000")
 
 
@@ -678,6 +711,10 @@ def handle_client(conn: socket.socket, addr: tuple,
                 break
 
             raw    = raw_bytes.decode(CHARSET, errors="replace")
+            if PROFILE != "legacy" and raw.endswith(("!", "?")):
+                # The live Sunmi gave no reply to a '!'-terminated request (and its app stalled).
+                log.warning(f"[{peer}] request ends with {raw[-1]!r}: no reply (a real Sunmi does not answer)")
+                continue
             fields = parse(raw)
             tm     = fields.get("001", "?")
 
@@ -740,12 +777,15 @@ def handle_client(conn: socket.socket, addr: tuple,
             elif tm == "003":
                 stan = fields.get("008", "?")
                 rc   = resolve_code(error_code) if mode == "void_refuse" else "000"
+                if PROFILE != "legacy" and not fields.get("004"):
+                    rc = "307"   # spec §4.3: NS is mandatory; the Lane3600 answers 307 (format error)
                 resp = cancellation_response(fields, rc)
                 log.info(f"[{peer}] Cancellation → RC={rc}  STAN={stan}")
                 send(conn, resp, CHARSET, "")
                 current_stan = None
-                # Sequence the TM 004 must echo in NS; NSA (005) is accepted for TM 003.
-                void_ns = (fields.get("004") or fields.get("005")) if rc == "000" else None
+                # Sequence the TM 004 must echo in NS (legacy profile: NSA accepted for TM 003).
+                tm003_ns = fields.get("004") or (fields.get("005") if PROFILE == "legacy" else None)
+                void_ns = tm003_ns if rc == "000" else None
 
             # ── TM=004  Cancellation confirmation ────────────────────────────
             elif tm == "004":
@@ -773,8 +813,9 @@ def handle_client(conn: socket.socket, addr: tuple,
             # ── TM=009  Network test ──────────────────────────────────────────
             elif tm == "009":
                 resp = network_test_response(fields)
-                log.info(f"[{peer}] Network test → RC=000")
-                send(conn, resp, CHARSET, terminator)
+                log.info(f"[{peer}] Network test → TM={parse(resp).get('001')} RC={parse(resp).get('013')}")
+                # The live Sunmi's TM 101 / 902 reply carried no terminator.
+                send(conn, resp, CHARSET, terminator if PROFILE == "legacy" else "")
 
             # ── TM=010  Totals ────────────────────────────────────────────────
             elif tm == "010":
@@ -888,8 +929,13 @@ def main() -> None:
     p.add_argument("--protocol", default="v2", choices=["v1", "v2"],
                    help="NAPS TLV generation: v1 terminates responses with '?' "
                         "(pre-v5.4.4), v2 with '!' (v5.4.4+, default).")
+    p.add_argument("--profile", default="sunmi", choices=["sunmi", "legacy"],
+                   help="Terminal behaviour: sunmi (live Sunmi P2, default) or legacy (earlier emulator).")
     p.add_argument("--debug", action="store_true", help="Print all TLV fields")
     args = p.parse_args()
+
+    global PROFILE
+    PROFILE = args.profile
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
